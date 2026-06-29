@@ -17,6 +17,7 @@ private enum Main {
     static func main() {
         setbuf(stdout, nil)
         setbuf(stderr, nil)
+        _ = NSApplication.shared
         ScreenshotQuickMarkupApp().run()
     }
 }
