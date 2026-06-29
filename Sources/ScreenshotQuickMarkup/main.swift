@@ -23,13 +23,14 @@ private enum Main {
 }
 
 @MainActor
-private final class ScreenshotQuickMarkupApp: @unchecked Sendable {
+private final class ScreenshotQuickMarkupApp: NSObject, NSApplicationDelegate, @unchecked Sendable {
     private let statusMenu = StatusMenu()
     private var hotKeyRef: EventHotKeyRef?
     private var captureOverlay: CaptureOverlayWindowController?
     private var editorWindows: [ImageEditorWindowController] = []
 
     func run() {
+        NSApplication.shared.delegate = self
         NSApplication.shared.setActivationPolicy(.accessory)
         NSWindow.allowsAutomaticWindowTabbing = true
 
@@ -41,6 +42,14 @@ private final class ScreenshotQuickMarkupApp: @unchecked Sendable {
 
         log("ScreenshotQuickMarkup is running. Press Option+Shift+S.")
         NSApplication.shared.run()
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard !editorWindows.isEmpty else { return true }
+        updateActivationPolicyForEditors()
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        newestVisibleEditorWindow()?.makeKeyAndOrderFront(nil)
+        return false
     }
 
     private func registerHotKey() {
@@ -526,7 +535,7 @@ private final class CaptureOverlayView: NSView {
     }
 }
 
-private enum MarkupTool: CaseIterable {
+private enum MarkupTool: String, CaseIterable {
     case select
     case pen
     case highlighter
@@ -578,6 +587,70 @@ private enum Annotation {
     case mosaic(start: NSPoint, end: NSPoint)
     case marker(number: Int, center: NSPoint, color: NSColor)
     case text(String, origin: NSPoint, color: NSColor, fontSize: CGFloat, background: Bool)
+}
+
+private enum ZoomMode {
+    case fit
+    case fixed(CGFloat)
+}
+
+private enum EditorPreferences {
+    private static let toolKey = "editor.lastTool"
+    private static let colorKey = "editor.lastColor"
+    private static let widthKey = "editor.lastWidth"
+
+    static var tool: MarkupTool {
+        get {
+            guard let rawValue = UserDefaults.standard.string(forKey: toolKey),
+                  let tool = MarkupTool(rawValue: rawValue)
+            else {
+                return .pen
+            }
+            return tool
+        }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: toolKey)
+        }
+    }
+
+    static var color: NSColor {
+        get {
+            guard let components = UserDefaults.standard.array(forKey: colorKey) as? [Double],
+                  components.count == 4
+            else {
+                return .systemRed
+            }
+            return NSColor(
+                calibratedRed: CGFloat(components[0]),
+                green: CGFloat(components[1]),
+                blue: CGFloat(components[2]),
+                alpha: CGFloat(components[3])
+            )
+        }
+        set {
+            guard let color = newValue.usingColorSpace(.deviceRGB) else { return }
+            UserDefaults.standard.set(
+                [
+                    Double(color.redComponent),
+                    Double(color.greenComponent),
+                    Double(color.blueComponent),
+                    Double(color.alphaComponent)
+                ],
+                forKey: colorKey
+            )
+        }
+    }
+
+    static var width: CGFloat {
+        get {
+            let storedWidth = UserDefaults.standard.double(forKey: widthKey)
+            guard storedWidth > 0 else { return 4 }
+            return min(24, max(1, CGFloat(storedWidth)))
+        }
+        set {
+            UserDefaults.standard.set(Double(min(24, max(1, newValue))), forKey: widthKey)
+        }
+    }
 }
 
 private final class ImageEditorWindowController: NSWindowController, NSWindowDelegate {
@@ -716,6 +789,8 @@ private final class ImageEditorViewController: NSViewController {
     private let canvasView: MarkupCanvasView
     private let toolButtons = NSStackView()
     private let colorSwatches = NSStackView()
+    private let zoomButtons = NSStackView()
+    private let scrollView = NSScrollView()
     private let colorWell = NSColorWell()
     private let widthSlider = NSSlider(value: 4, minValue: 1, maxValue: 24, target: nil, action: nil)
     private let fontSizeSlider = NSSlider(value: 28, minValue: 12, maxValue: 96, target: nil, action: nil)
@@ -743,7 +818,7 @@ private final class ImageEditorViewController: NSViewController {
         toolbar.translatesAutoresizingMaskIntoConstraints = false
 
         toolButtons.orientation = .horizontal
-        toolButtons.spacing = 6
+        toolButtons.spacing = 4
         toolButtons.translatesAutoresizingMaskIntoConstraints = false
 
         for tool in MarkupTool.allCases {
@@ -764,11 +839,12 @@ private final class ImageEditorViewController: NSViewController {
             colorSwatches.addArrangedSubview(swatch)
         }
 
-        colorWell.color = .systemRed
+        colorWell.color = EditorPreferences.color
         colorWell.target = self
         colorWell.action = #selector(styleChanged)
         colorWell.translatesAutoresizingMaskIntoConstraints = false
 
+        widthSlider.doubleValue = Double(EditorPreferences.width)
         widthSlider.target = self
         widthSlider.action = #selector(styleChanged)
         widthSlider.translatesAutoresizingMaskIntoConstraints = false
@@ -777,12 +853,19 @@ private final class ImageEditorViewController: NSViewController {
         fontSizeSlider.action = #selector(styleChanged)
         fontSizeSlider.translatesAutoresizingMaskIntoConstraints = false
 
+        zoomButtons.orientation = .horizontal
+        zoomButtons.spacing = 4
+        zoomButtons.translatesAutoresizingMaskIntoConstraints = false
+        zoomButtons.addArrangedSubview(zoomButton(title: "-", action: #selector(zoomOutTapped), tooltip: "Zoom out"))
+        zoomButtons.addArrangedSubview(zoomButton(title: "100%", action: #selector(actualSizeTapped), tooltip: "Actual size"))
+        zoomButtons.addArrangedSubview(zoomButton(title: "Fit", action: #selector(fitTapped), tooltip: "Fit to window"))
+        zoomButtons.addArrangedSubview(zoomButton(title: "+", action: #selector(zoomInTapped), tooltip: "Zoom in"))
+
         let copyButton = toolbarButton(title: "Copy", symbolName: "doc.on.doc", action: #selector(copyTapped))
         let saveButton = toolbarButton(title: "Save", symbolName: "square.and.arrow.down", action: #selector(saveTapped))
         let doneButton = toolbarButton(title: "Done", symbolName: "checkmark.circle.fill", action: #selector(doneTapped))
         doneButton.contentTintColor = .controlAccentColor
 
-        let scrollView = NSScrollView()
         scrollView.documentView = canvasView
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = true
@@ -796,6 +879,7 @@ private final class ImageEditorViewController: NSViewController {
         toolbar.addSubview(colorWell)
         toolbar.addSubview(widthSlider)
         toolbar.addSubview(fontSizeSlider)
+        toolbar.addSubview(zoomButtons)
         toolbar.addSubview(copyButton)
         toolbar.addSubview(saveButton)
         toolbar.addSubview(doneButton)
@@ -820,11 +904,14 @@ private final class ImageEditorViewController: NSViewController {
 
             widthSlider.leadingAnchor.constraint(equalTo: colorWell.trailingAnchor, constant: 14),
             widthSlider.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
-            widthSlider.widthAnchor.constraint(equalToConstant: 130),
+        widthSlider.widthAnchor.constraint(equalToConstant: 104),
 
-            fontSizeSlider.leadingAnchor.constraint(equalTo: widthSlider.trailingAnchor, constant: 14),
-            fontSizeSlider.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
-            fontSizeSlider.widthAnchor.constraint(equalToConstant: 130),
+        fontSizeSlider.leadingAnchor.constraint(equalTo: widthSlider.trailingAnchor, constant: 14),
+        fontSizeSlider.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
+        fontSizeSlider.widthAnchor.constraint(equalToConstant: 104),
+
+            zoomButtons.leadingAnchor.constraint(equalTo: fontSizeSlider.trailingAnchor, constant: 14),
+            zoomButtons.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
 
             doneButton.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -12),
             doneButton.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
@@ -834,7 +921,7 @@ private final class ImageEditorViewController: NSViewController {
 
             copyButton.trailingAnchor.constraint(equalTo: saveButton.leadingAnchor, constant: -8),
             copyButton.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
-            copyButton.leadingAnchor.constraint(greaterThanOrEqualTo: fontSizeSlider.trailingAnchor, constant: 14),
+            copyButton.leadingAnchor.constraint(greaterThanOrEqualTo: zoomButtons.trailingAnchor, constant: 14),
 
             scrollView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
@@ -843,14 +930,14 @@ private final class ImageEditorViewController: NSViewController {
         ])
 
         view = root
-        canvasView.tool = .pen
+        canvasView.tool = EditorPreferences.tool
         updateSelectedToolButtons()
         styleChanged()
     }
 
     override func viewDidLayout() {
         super.viewDidLayout()
-        canvasView.updateCanvasSize(view.bounds.size)
+        canvasView.updateCanvasSize(scrollView.contentView.bounds.size)
     }
 
     func undo() {
@@ -867,6 +954,7 @@ private final class ImageEditorViewController: NSViewController {
 
     @objc private func selectTool(_ sender: ToolButton) {
         canvasView.tool = sender.tool
+        EditorPreferences.tool = sender.tool
         updateSelectedToolButtons()
     }
 
@@ -874,6 +962,8 @@ private final class ImageEditorViewController: NSViewController {
         canvasView.currentColor = colorWell.color
         canvasView.currentWidth = CGFloat(widthSlider.doubleValue)
         canvasView.currentFontSize = CGFloat(fontSizeSlider.doubleValue)
+        EditorPreferences.color = colorWell.color
+        EditorPreferences.width = CGFloat(widthSlider.doubleValue)
     }
 
     @objc private func selectSwatch(_ sender: ColorSwatchButton) {
@@ -893,14 +983,49 @@ private final class ImageEditorViewController: NSViewController {
         onDone?()
     }
 
+    @objc private func zoomOutTapped() {
+        canvasView.zoomOut(in: scrollView.contentView.bounds.size)
+    }
+
+    @objc private func actualSizeTapped() {
+        canvasView.zoomActualSize(in: scrollView.contentView.bounds.size)
+    }
+
+    @objc private func fitTapped() {
+        canvasView.zoomToFit(in: scrollView.contentView.bounds.size)
+    }
+
+    @objc private func zoomInTapped() {
+        canvasView.zoomIn(in: scrollView.contentView.bounds.size)
+    }
+
     private func toolbarButton(title: String, symbolName: String, action: Selector) -> NSButton {
-        let button = NSButton(title: title, target: self, action: action)
+        let button = NSButton(title: "", target: self, action: action)
         button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: title)
-        button.imagePosition = .imageLeading
+        button.imagePosition = .imageOnly
         button.bezelStyle = .rounded
         button.controlSize = .regular
         button.font = .systemFont(ofSize: 12, weight: .medium)
+        button.toolTip = title
         button.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: 36),
+            button.heightAnchor.constraint(equalToConstant: 32)
+        ])
+        return button
+    }
+
+    private func zoomButton(title: String, action: Selector, tooltip: String) -> NSButton {
+        let button = NSButton(title: title, target: self, action: action)
+        button.bezelStyle = .rounded
+        button.controlSize = .small
+        button.font = .systemFont(ofSize: 11, weight: .medium)
+        button.toolTip = tooltip
+        button.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            button.heightAnchor.constraint(equalToConstant: 28),
+            button.widthAnchor.constraint(greaterThanOrEqualToConstant: title == "100%" ? 46 : 32)
+        ])
         return button
     }
 
@@ -933,8 +1058,8 @@ private final class ToolButton: NSButton {
         isBordered = false
         translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            widthAnchor.constraint(equalToConstant: 36),
-            heightAnchor.constraint(equalToConstant: 36)
+            widthAnchor.constraint(equalToConstant: 32),
+            heightAnchor.constraint(equalToConstant: 32)
         ])
     }
 
@@ -958,8 +1083,8 @@ private final class ColorSwatchButton: NSButton {
         toolTip = "Use color"
         translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            widthAnchor.constraint(equalToConstant: 22),
-            heightAnchor.constraint(equalToConstant: 22)
+            widthAnchor.constraint(equalToConstant: 20),
+            heightAnchor.constraint(equalToConstant: 20)
         ])
     }
 
@@ -983,6 +1108,8 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
     private var activeTextField: NSTextField?
     private var activeTextOrigin: NSPoint?
     private var previewScale: CGFloat = 1
+    private var zoomMode: ZoomMode = .fit
+    private var lastContainerSize = NSSize(width: 980, height: 654)
     private var nextMarkerNumber = 1
 
     override var isFlipped: Bool { true }
@@ -1002,11 +1129,47 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
     override var acceptsFirstResponder: Bool { true }
 
     func updateCanvasSize(_ containerSize: NSSize) {
+        lastContainerSize = containerSize
+        applyCanvasSize()
+    }
+
+    func zoomIn(in containerSize: NSSize) {
+        lastContainerSize = containerSize
+        setZoomScale(previewScale * 1.25)
+    }
+
+    func zoomOut(in containerSize: NSSize) {
+        lastContainerSize = containerSize
+        setZoomScale(previewScale / 1.25)
+    }
+
+    func zoomActualSize(in containerSize: NSSize) {
+        lastContainerSize = containerSize
+        setZoomScale(1)
+    }
+
+    func zoomToFit(in containerSize: NSSize) {
+        lastContainerSize = containerSize
+        zoomMode = .fit
+        applyCanvasSize()
+    }
+
+    private func setZoomScale(_ scale: CGFloat) {
+        zoomMode = .fixed(min(6, max(0.1, scale)))
+        applyCanvasSize()
+    }
+
+    private func applyCanvasSize() {
         let imageSize = image.size
-        previewScale = displayScale(for: imageSize, in: containerSize)
+        switch zoomMode {
+        case .fit:
+            previewScale = displayScale(for: imageSize, in: lastContainerSize)
+        case let .fixed(scale):
+            previewScale = scale
+        }
         let size = NSSize(
-            width: max(imageSize.width * previewScale + 80, containerSize.width),
-            height: max(imageSize.height * previewScale + 80, containerSize.height)
+            width: max(imageSize.width * previewScale + 80, lastContainerSize.width),
+            height: max(imageSize.height * previewScale + 80, lastContainerSize.height)
         )
         setFrameSize(size)
         needsDisplay = true
