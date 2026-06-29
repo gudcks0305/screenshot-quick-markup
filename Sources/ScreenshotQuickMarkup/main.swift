@@ -162,8 +162,7 @@ private final class ScreenshotQuickMarkupApp: @unchecked Sendable {
     }
 
     private func updateActivationPolicyForEditors() {
-        let hasVisibleEditor = editorWindows.contains { $0.window?.isVisible == true }
-        NSApplication.shared.setActivationPolicy(hasVisibleEditor ? .regular : .accessory)
+        NSApplication.shared.setActivationPolicy(editorWindows.isEmpty ? .accessory : .regular)
     }
 
     private func newestVisibleEditorWindow() -> NSWindow? {
