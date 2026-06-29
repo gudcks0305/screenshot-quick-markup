@@ -544,6 +544,7 @@ private enum MarkupTool: String, CaseIterable {
     case ellipse
     case mosaic
     case marker
+    case check
     case text
 
     var symbolName: String {
@@ -556,6 +557,7 @@ private enum MarkupTool: String, CaseIterable {
         case .ellipse: return "circle"
         case .mosaic: return "checkerboard.rectangle"
         case .marker: return "mappin.circle"
+        case .check: return "checkmark.circle"
         case .text: return "textformat"
         }
     }
@@ -570,6 +572,7 @@ private enum MarkupTool: String, CaseIterable {
         case .ellipse: return "Ellipse"
         case .mosaic: return "Blur"
         case .marker: return "Marker"
+        case .check: return "Check"
         case .text: return "Text"
         }
     }
@@ -586,6 +589,7 @@ private enum Annotation {
     case shape(kind: ShapeKind, start: NSPoint, end: NSPoint, color: NSColor, width: CGFloat)
     case mosaic(start: NSPoint, end: NSPoint, strength: CGFloat)
     case marker(number: Int, center: NSPoint, color: NSColor)
+    case checkmark(center: NSPoint, color: NSColor)
     case text(String, origin: NSPoint, color: NSColor, fontSize: CGFloat, background: Bool)
 }
 
@@ -674,7 +678,7 @@ private final class ImageEditorWindowController: NSWindowController, NSWindowDel
         )
         let captureTime = Self.titleTimeFormatter.string(from: Date())
         window.title = "\(captureTime) \(Int(image.size.width))x\(Int(image.size.height))"
-        window.minSize = NSSize(width: 900, height: 640)
+        window.minSize = NSSize(width: 1080, height: 640)
         window.level = .normal
         window.tabbingIdentifier = "ScreenshotQuickMarkup.Editor"
         window.tabbingMode = .preferred
@@ -792,6 +796,8 @@ private final class ImageEditorViewController: NSViewController {
     private let zoomButtons = NSStackView()
     private let scrollView = NSScrollView()
     private let colorWell = NSColorWell()
+    private let widthLabel = NSTextField(labelWithString: "Size")
+    private let widthValueLabel = NSTextField(labelWithString: "4")
     private let widthSlider = NSSlider(value: 4, minValue: 1, maxValue: 24, target: nil, action: nil)
     private let fontSizeSlider = NSSlider(value: 28, minValue: 12, maxValue: 96, target: nil, action: nil)
 
@@ -818,7 +824,7 @@ private final class ImageEditorViewController: NSViewController {
         toolbar.translatesAutoresizingMaskIntoConstraints = false
 
         toolButtons.orientation = .horizontal
-        toolButtons.spacing = 4
+        toolButtons.spacing = 3
         toolButtons.translatesAutoresizingMaskIntoConstraints = false
 
         for tool in MarkupTool.allCases {
@@ -830,7 +836,7 @@ private final class ImageEditorViewController: NSViewController {
         }
 
         colorSwatches.orientation = .horizontal
-        colorSwatches.spacing = 4
+        colorSwatches.spacing = 3
         colorSwatches.translatesAutoresizingMaskIntoConstraints = false
         for color in [NSColor.systemRed, .systemYellow, .systemGreen, .systemBlue, .systemPurple, .white, .black] {
             let swatch = ColorSwatchButton(color: color)
@@ -843,6 +849,16 @@ private final class ImageEditorViewController: NSViewController {
         colorWell.target = self
         colorWell.action = #selector(styleChanged)
         colorWell.translatesAutoresizingMaskIntoConstraints = false
+
+        widthLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        widthLabel.textColor = .secondaryLabelColor
+        widthLabel.alignment = .right
+        widthLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        widthValueLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        widthValueLabel.textColor = .secondaryLabelColor
+        widthValueLabel.alignment = .left
+        widthValueLabel.translatesAutoresizingMaskIntoConstraints = false
 
         widthSlider.doubleValue = Double(EditorPreferences.width)
         widthSlider.target = self
@@ -878,7 +894,9 @@ private final class ImageEditorViewController: NSViewController {
         toolbar.addSubview(toolButtons)
         toolbar.addSubview(colorSwatches)
         toolbar.addSubview(colorWell)
+        toolbar.addSubview(widthLabel)
         toolbar.addSubview(widthSlider)
+        toolbar.addSubview(widthValueLabel)
         toolbar.addSubview(fontSizeSlider)
         toolbar.addSubview(zoomButtons)
         toolbar.addSubview(copyButton)
@@ -903,13 +921,21 @@ private final class ImageEditorViewController: NSViewController {
             colorWell.widthAnchor.constraint(equalToConstant: 32),
             colorWell.heightAnchor.constraint(equalToConstant: 26),
 
-            widthSlider.leadingAnchor.constraint(equalTo: colorWell.trailingAnchor, constant: 14),
-            widthSlider.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
-        widthSlider.widthAnchor.constraint(equalToConstant: 104),
+            widthLabel.leadingAnchor.constraint(equalTo: colorWell.trailingAnchor, constant: 10),
+            widthLabel.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
+            widthLabel.widthAnchor.constraint(equalToConstant: 34),
 
-        fontSizeSlider.leadingAnchor.constraint(equalTo: widthSlider.trailingAnchor, constant: 14),
-        fontSizeSlider.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
-        fontSizeSlider.widthAnchor.constraint(equalToConstant: 104),
+            widthSlider.leadingAnchor.constraint(equalTo: widthLabel.trailingAnchor, constant: 6),
+            widthSlider.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
+            widthSlider.widthAnchor.constraint(equalToConstant: 78),
+
+            widthValueLabel.leadingAnchor.constraint(equalTo: widthSlider.trailingAnchor, constant: 6),
+            widthValueLabel.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
+            widthValueLabel.widthAnchor.constraint(equalToConstant: 24),
+
+            fontSizeSlider.leadingAnchor.constraint(equalTo: widthValueLabel.trailingAnchor, constant: 12),
+            fontSizeSlider.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
+            fontSizeSlider.widthAnchor.constraint(equalToConstant: 78),
 
             zoomButtons.leadingAnchor.constraint(equalTo: fontSizeSlider.trailingAnchor, constant: 14),
             zoomButtons.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
@@ -965,6 +991,7 @@ private final class ImageEditorViewController: NSViewController {
         canvasView.currentFontSize = CGFloat(fontSizeSlider.doubleValue)
         EditorPreferences.color = colorWell.color
         EditorPreferences.width = CGFloat(widthSlider.doubleValue)
+        updateStyleLabels()
     }
 
     @objc private func selectSwatch(_ sender: ColorSwatchButton) {
@@ -1034,6 +1061,12 @@ private final class ImageEditorViewController: NSViewController {
         for case let button as ToolButton in toolButtons.arrangedSubviews {
             button.isSelectedTool = button.tool == canvasView.tool
         }
+        updateStyleLabels()
+    }
+
+    private func updateStyleLabels() {
+        widthLabel.stringValue = canvasView.tool == .mosaic ? "Blur" : "Size"
+        widthValueLabel.stringValue = "\(Int(widthSlider.doubleValue.rounded()))"
     }
 }
 
@@ -1059,8 +1092,8 @@ private final class ToolButton: NSButton {
         isBordered = false
         translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            widthAnchor.constraint(equalToConstant: 32),
-            heightAnchor.constraint(equalToConstant: 32)
+            widthAnchor.constraint(equalToConstant: 30),
+            heightAnchor.constraint(equalToConstant: 30)
         ])
     }
 
@@ -1084,8 +1117,8 @@ private final class ColorSwatchButton: NSButton {
         toolTip = "Use color"
         translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            widthAnchor.constraint(equalToConstant: 20),
-            heightAnchor.constraint(equalToConstant: 20)
+            widthAnchor.constraint(equalToConstant: 18),
+            heightAnchor.constraint(equalToConstant: 18)
         ])
     }
 
@@ -1111,7 +1144,6 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
     private var previewScale: CGFloat = 1
     private var zoomMode: ZoomMode = .fit
     private var lastContainerSize = NSSize(width: 980, height: 654)
-    private var nextMarkerNumber = 1
 
     override var isFlipped: Bool { true }
 
@@ -1213,8 +1245,9 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
             currentShapeStart = point
             currentShapeEnd = point
         case .marker:
-            append(.marker(number: nextMarkerNumber, center: point!, color: currentColor))
-            nextMarkerNumber += 1
+            append(.marker(number: nextMarkerNumber(), center: point!, color: currentColor))
+        case .check:
+            append(.checkmark(center: point!, color: currentColor))
         case .select, .text:
             break
         }
@@ -1232,7 +1265,7 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
         case .mosaic:
             currentShapeEnd = point
             needsDisplay = true
-        case .select, .marker, .text:
+        case .select, .marker, .check, .text:
             break
         }
     }
@@ -1260,7 +1293,7 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
             appendCurrentShape(.ellipse)
         case .mosaic:
             appendCurrentMosaic()
-        case .select, .marker, .text:
+        case .select, .marker, .check, .text:
             break
         }
     }
@@ -1328,6 +1361,16 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
         annotations.append(annotation)
         redoStack.removeAll()
         needsDisplay = true
+    }
+
+    private func nextMarkerNumber() -> Int {
+        let maxNumber = annotations.compactMap { annotation -> Int? in
+            if case let .marker(number, _, _) = annotation {
+                return number
+            }
+            return nil
+        }.max() ?? 0
+        return maxNumber + 1
     }
 
     private func appendCurrentShape(_ kind: ShapeKind) {
@@ -1404,7 +1447,7 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
             drawCurrentShape(.ellipse, transform: transform)
         case .mosaic:
             drawCurrentMosaic(transform: transform)
-        case .select, .text:
+        case .select, .check, .text:
             break
         case .marker:
             break
@@ -1463,6 +1506,9 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
 
         case let .marker(number, center, color):
             drawMarker(number: number, center: transform(center), radius: 14 * max(displayScale, 0.75), color: color)
+
+        case let .checkmark(center, color):
+            drawCheckmark(center: transform(center), radius: 14 * max(displayScale, 0.75), color: color)
 
         case let .text(text, origin, color, fontSize, background):
             let point = transform(origin)
@@ -1560,6 +1606,30 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
         )
     }
 
+    private func drawCheckmark(center: NSPoint, radius: CGFloat, color: NSColor) {
+        let rect = NSRect(
+            x: center.x - radius,
+            y: center.y - radius,
+            width: radius * 2,
+            height: radius * 2
+        )
+        color.setFill()
+        NSBezierPath(ovalIn: rect).fill()
+        NSColor.white.setStroke()
+        let border = NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1))
+        border.lineWidth = max(1.5, radius * 0.12)
+        border.stroke()
+
+        let check = NSBezierPath()
+        check.move(to: NSPoint(x: center.x - radius * 0.48, y: center.y + radius * 0.02))
+        check.line(to: NSPoint(x: center.x - radius * 0.14, y: center.y + radius * 0.34))
+        check.line(to: NSPoint(x: center.x + radius * 0.52, y: center.y - radius * 0.38))
+        check.lineWidth = max(2.4, radius * 0.22)
+        check.lineCapStyle = .round
+        check.lineJoinStyle = .round
+        check.stroke()
+    }
+
     private func renderedImage() -> NSImage? {
         let size = image.size
         let output = NSImage(size: size)
@@ -1613,6 +1683,8 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
             drawMosaic(sourceRect: rect, destinationRect: rect, strength: strength)
         case let .marker(number, center, color):
             drawMarker(number: number, center: center, radius: 14, color: color)
+        case let .checkmark(center, color):
+            drawCheckmark(center: center, radius: 14, color: color)
         case let .text(text, origin, color, fontSize, background):
             let font = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
             let attributes: [NSAttributedString.Key: Any] = [
