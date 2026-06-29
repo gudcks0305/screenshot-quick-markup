@@ -144,9 +144,11 @@ private final class ScreenshotQuickMarkupApp: @unchecked Sendable {
         editor.onClose = { [weak self, weak editor] in
             guard let self, let editor else { return }
             self.editorWindows.removeAll { $0 === editor }
+            self.updateActivationPolicyForEditors()
         }
         let lastTabbedWindow = newestVisibleEditorWindow()
         editorWindows.append(editor)
+        updateActivationPolicyForEditors()
         NSApplication.shared.activate(ignoringOtherApps: true)
 
         if let lastTabbedWindow, let newWindow = editor.window {
@@ -157,6 +159,11 @@ private final class ScreenshotQuickMarkupApp: @unchecked Sendable {
         }
 
         log("Editor window shown. Open editors: \(editorWindows.count).")
+    }
+
+    private func updateActivationPolicyForEditors() {
+        let hasVisibleEditor = editorWindows.contains { $0.window?.isVisible == true }
+        NSApplication.shared.setActivationPolicy(hasVisibleEditor ? .regular : .accessory)
     }
 
     private func newestVisibleEditorWindow() -> NSWindow? {
