@@ -584,7 +584,7 @@ private enum ShapeKind {
 private enum Annotation {
     case stroke(points: [NSPoint], color: NSColor, width: CGFloat, alpha: CGFloat)
     case shape(kind: ShapeKind, start: NSPoint, end: NSPoint, color: NSColor, width: CGFloat)
-    case mosaic(start: NSPoint, end: NSPoint)
+    case mosaic(start: NSPoint, end: NSPoint, strength: CGFloat)
     case marker(number: Int, center: NSPoint, color: NSColor)
     case text(String, origin: NSPoint, color: NSColor, fontSize: CGFloat, background: Bool)
 }
@@ -847,6 +847,7 @@ private final class ImageEditorViewController: NSViewController {
         widthSlider.doubleValue = Double(EditorPreferences.width)
         widthSlider.target = self
         widthSlider.action = #selector(styleChanged)
+        widthSlider.toolTip = "Stroke width / blur strength"
         widthSlider.translatesAutoresizingMaskIntoConstraints = false
 
         fontSizeSlider.target = self
@@ -1347,7 +1348,7 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
         else {
             return
         }
-        append(.mosaic(start: start, end: end))
+        append(.mosaic(start: start, end: end, strength: currentWidth))
     }
 
     private func beginTextEditing(at point: NSPoint) {
@@ -1417,7 +1418,7 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
 
     private func drawCurrentMosaic(transform: (NSPoint) -> NSPoint) {
         guard let start = currentShapeStart, let end = currentShapeEnd else { return }
-        draw(.mosaic(start: start, end: end), transform: transform)
+        draw(.mosaic(start: start, end: end, strength: currentWidth), transform: transform)
     }
 
     private func draw(_ annotation: Annotation, transform: (NSPoint) -> NSPoint) {
@@ -1453,8 +1454,12 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
                 path.stroke()
             }
 
-        case let .mosaic(start, end):
-            drawMosaic(sourceRect: normalizedRect(from: start, to: end), destinationRect: normalizedRect(from: transform(start), to: transform(end)))
+        case let .mosaic(start, end, strength):
+            drawMosaic(
+                sourceRect: normalizedRect(from: start, to: end),
+                destinationRect: normalizedRect(from: transform(start), to: transform(end)),
+                strength: strength
+            )
 
         case let .marker(number, center, color):
             drawMarker(number: number, center: transform(center), radius: 14 * max(displayScale, 0.75), color: color)
@@ -1481,7 +1486,7 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
         return rect.width / max(image.size.width, 1)
     }
 
-    private func drawMosaic(sourceRect: NSRect, destinationRect: NSRect) {
+    private func drawMosaic(sourceRect: NSRect, destinationRect: NSRect, strength: CGFloat) {
         guard sourceRect.width >= 2,
               sourceRect.height >= 2,
               destinationRect.width >= 2,
@@ -1490,7 +1495,7 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
             return
         }
 
-        let blockSize = max(8, min(destinationRect.width, destinationRect.height) / 14)
+        let blockSize = min(64, max(3, 4 + min(24, max(1, strength)) * 2.5))
         let pixelatedSize = NSSize(
             width: max(2, destinationRect.width / blockSize),
             height: max(2, destinationRect.height / blockSize)
@@ -1500,7 +1505,7 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
         NSGraphicsContext.current?.imageInterpolation = .low
         image.draw(
             in: NSRect(origin: .zero, size: pixelatedSize),
-            from: sourceRect,
+            from: imageSourceRect(from: sourceRect),
             operation: .copy,
             fraction: 1
         )
@@ -1517,6 +1522,15 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
         border.lineWidth = max(1, displayScale)
         border.stroke()
         NSGraphicsContext.restoreGraphicsState()
+    }
+
+    private func imageSourceRect(from rect: NSRect) -> NSRect {
+        NSRect(
+            x: rect.minX,
+            y: max(0, image.size.height - rect.maxY),
+            width: rect.width,
+            height: rect.height
+        )
     }
 
     private func drawMarker(number: Int, center: NSPoint, radius: CGFloat, color: NSColor) {
@@ -1594,9 +1608,9 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
                 path.lineWidth = width
                 path.stroke()
             }
-        case let .mosaic(start, end):
+        case let .mosaic(start, end, strength):
             let rect = normalizedRect(from: start, to: end)
-            drawMosaic(sourceRect: rect, destinationRect: rect)
+            drawMosaic(sourceRect: rect, destinationRect: rect, strength: strength)
         case let .marker(number, center, color):
             drawMarker(number: number, center: center, radius: 14, color: color)
         case let .text(text, origin, color, fontSize, background):
