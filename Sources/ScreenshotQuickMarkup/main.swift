@@ -145,20 +145,25 @@ private final class ScreenshotQuickMarkupApp: @unchecked Sendable {
             guard let self, let editor else { return }
             self.editorWindows.removeAll { $0 === editor }
         }
-        let existingWindow = editorWindows
-            .compactMap { $0.window }
-            .first { $0.isVisible }
+        let lastTabbedWindow = newestVisibleEditorWindow()
         editorWindows.append(editor)
         NSApplication.shared.activate(ignoringOtherApps: true)
 
-        if let existingWindow, let newWindow = editor.window {
-            existingWindow.addTabbedWindow(newWindow, ordered: .above)
+        if let lastTabbedWindow, let newWindow = editor.window {
+            lastTabbedWindow.addTabbedWindow(newWindow, ordered: .above)
             newWindow.makeKeyAndOrderFront(nil)
         } else {
             editor.show()
         }
 
         log("Editor window shown. Open editors: \(editorWindows.count).")
+    }
+
+    private func newestVisibleEditorWindow() -> NSWindow? {
+        let visibleWindow = editorWindows
+            .compactMap { $0.window }
+            .first { $0.isVisible }
+        return visibleWindow?.tabbedWindows?.last ?? visibleWindow
     }
 
     private func showCapturePermissionAlert() {
@@ -573,6 +578,11 @@ private final class ImageEditorWindowController: NSWindowController, NSWindowDel
     var onClose: (() -> Void)?
 
     private let editorViewController: ImageEditorViewController
+    private static let titleTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
 
     init(image: NSImage) {
         editorViewController = ImageEditorViewController(image: image)
@@ -583,7 +593,8 @@ private final class ImageEditorWindowController: NSWindowController, NSWindowDel
             backing: .buffered,
             defer: false
         )
-        window.title = "Screenshot Quick Markup"
+        let captureTime = Self.titleTimeFormatter.string(from: Date())
+        window.title = "\(captureTime) \(Int(image.size.width))x\(Int(image.size.height))"
         window.minSize = NSSize(width: 900, height: 640)
         window.level = .normal
         window.tabbingIdentifier = "ScreenshotQuickMarkup.Editor"
