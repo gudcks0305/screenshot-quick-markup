@@ -31,6 +31,7 @@ private final class ScreenshotQuickMarkupApp: @unchecked Sendable {
 
     func run() {
         NSApplication.shared.setActivationPolicy(.accessory)
+        NSWindow.allowsAutomaticWindowTabbing = true
 
         statusMenu.configure(
             capture: { [weak self] in self?.beginCapture() },
@@ -144,9 +145,19 @@ private final class ScreenshotQuickMarkupApp: @unchecked Sendable {
             guard let self, let editor else { return }
             self.editorWindows.removeAll { $0 === editor }
         }
+        let existingWindow = editorWindows
+            .compactMap { $0.window }
+            .first { $0.isVisible }
         editorWindows.append(editor)
         NSApplication.shared.activate(ignoringOtherApps: true)
-        editor.show()
+
+        if let existingWindow, let newWindow = editor.window {
+            existingWindow.addTabbedWindow(newWindow, ordered: .above)
+            newWindow.makeKeyAndOrderFront(nil)
+        } else {
+            editor.show()
+        }
+
         log("Editor window shown. Open editors: \(editorWindows.count).")
     }
 
@@ -574,8 +585,9 @@ private final class ImageEditorWindowController: NSWindowController, NSWindowDel
         )
         window.title = "Screenshot Quick Markup"
         window.minSize = NSSize(width: 900, height: 640)
-        window.level = .floating
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.level = .normal
+        window.tabbingIdentifier = "ScreenshotQuickMarkup.Editor"
+        window.tabbingMode = .preferred
         window.isReleasedWhenClosed = false
         window.center()
         window.contentViewController = editorViewController
