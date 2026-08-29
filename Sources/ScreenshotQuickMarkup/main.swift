@@ -2,7 +2,9 @@
 import Carbon
 import Carbon.HIToolbox
 import CoreGraphics
+import Darwin
 import Foundation
+import ScreenshotQuickMarkupCore
 
 private let hotKeySignature = OSType(
     UInt32(UInt8(ascii: "S")) << 24
@@ -11,12 +13,32 @@ private let hotKeySignature = OSType(
         | UInt32(UInt8(ascii: "K"))
 )
 
+private enum SingleInstanceLock {
+    static let descriptor: Int32 = {
+        let lockURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("com.local.screenshot-quick-markup.lock")
+        let descriptor = Darwin.open(lockURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else { return -1 }
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            Darwin.close(descriptor)
+            return -1
+        }
+        return descriptor
+    }()
+
+    static var isPrimary: Bool { descriptor >= 0 }
+}
+
 @main
 @MainActor
 private enum Main {
     static func main() {
         setbuf(stdout, nil)
         setbuf(stderr, nil)
+        guard SingleInstanceLock.isPrimary else {
+            log("Another Screenshot Quick Markup instance is already running.")
+            return
+        }
         _ = NSApplication.shared
         ScreenshotQuickMarkupApp().run()
     }
@@ -36,6 +58,7 @@ private final class ScreenshotQuickMarkupApp: NSObject, NSApplicationDelegate, @
 
         statusMenu.configure(
             capture: { [weak self] in self?.beginCapture() },
+            editClipboard: { [weak self] in self?.openClipboardEditor() },
             quit: { NSApplication.shared.terminate(nil) }
         )
         registerHotKey()
@@ -45,10 +68,13 @@ private final class ScreenshotQuickMarkupApp: NSObject, NSApplicationDelegate, @
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        guard !editorWindows.isEmpty else { return true }
+        guard !editorWindows.isEmpty, let editorWindow = newestVisibleEditorWindow() else { return true }
         updateActivationPolicyForEditors()
         NSApplication.shared.activate(ignoringOtherApps: true)
-        newestVisibleEditorWindow()?.makeKeyAndOrderFront(nil)
+        if editorWindow.isMiniaturized {
+            editorWindow.deminiaturize(nil)
+        }
+        editorWindow.makeKeyAndOrderFront(nil)
         return false
     }
 
@@ -148,6 +174,24 @@ private final class ScreenshotQuickMarkupApp: NSObject, NSApplicationDelegate, @
         overlay.show()
     }
 
+    private func openClipboardEditor() {
+        let pasteboard = NSPasteboard.general
+        let imageData = pasteboard.data(forType: .png) ?? pasteboard.data(forType: .tiff)
+        guard let imageData, let image = NSImage(data: imageData) else {
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.messageText = "No image on the clipboard"
+            alert.informativeText = "Copy an image, then choose Mark Up Clipboard Image again."
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+
+        log("Opening clipboard image for markup.")
+        openEditor(image: image)
+    }
+
     private func openEditor(image: NSImage) {
         let editor = ImageEditorWindowController(image: image)
         editor.onClose = { [weak self, weak editor] in
@@ -166,6 +210,7 @@ private final class ScreenshotQuickMarkupApp: NSObject, NSApplicationDelegate, @
         } else {
             editor.show()
         }
+        editor.focusCanvas()
 
         log("Editor window shown. Open editors: \(editorWindows.count).")
     }
@@ -175,10 +220,9 @@ private final class ScreenshotQuickMarkupApp: NSObject, NSApplicationDelegate, @
     }
 
     private func newestVisibleEditorWindow() -> NSWindow? {
-        let visibleWindow = editorWindows
-            .compactMap { $0.window }
-            .first { $0.isVisible }
-        return visibleWindow?.tabbedWindows?.last ?? visibleWindow
+        let windows = editorWindows.compactMap { $0.window }
+        let preferredWindow = windows.first { $0.isVisible && !$0.isMiniaturized } ?? windows.last
+        return preferredWindow?.tabbedWindows?.last ?? preferredWindow
     }
 
     private func showCapturePermissionAlert() {
@@ -200,14 +244,19 @@ private final class ScreenshotQuickMarkupApp: NSObject, NSApplicationDelegate, @
 private final class StatusMenu {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 
-    func configure(capture: @escaping () -> Void, quit: @escaping () -> Void) {
+    func configure(
+        capture: @escaping () -> Void,
+        editClipboard: @escaping () -> Void,
+        quit: @escaping () -> Void
+    ) {
         statusItem.button?.image = NSImage(
             systemSymbolName: "camera.viewfinder",
             accessibilityDescription: "Screenshot Quick Markup"
         )
 
         let menu = NSMenu()
-        menu.addItem(ClosureMenuItem(title: "Capture", action: capture))
+        menu.addItem(ClosureMenuItem(title: "Capture Area  ⌥⇧S", action: capture))
+        menu.addItem(ClosureMenuItem(title: "Mark Up Clipboard Image", action: editClipboard))
         menu.addItem(.separator())
         menu.addItem(ClosureMenuItem(title: "Quit", action: quit))
         statusItem.menu = menu
@@ -274,14 +323,13 @@ private enum ScreenCapture {
             return NSImage(cgImage: fullImage, size: screenshot.screenFrame.size)
         }
 
-        let scaleX = CGFloat(fullImage.width) / screenshot.screenFrame.width
-        let scaleY = CGFloat(fullImage.height) / screenshot.screenFrame.height
-        let cropRect = CGRect(
-            x: selection.minX * scaleX,
-            y: (screenshot.screenFrame.height - selection.maxY) * scaleY,
-            width: selection.width * scaleX,
-            height: selection.height * scaleY
-        ).integral
+        guard let cropRect = MarkupGeometry.captureCropRect(
+            selection: selection,
+            screenSize: screenshot.screenFrame.size,
+            imagePixelSize: CGSize(width: fullImage.width, height: fullImage.height)
+        ) else {
+            return nil
+        }
 
         guard let cropped = fullImage.cropping(to: cropRect) else { return nil }
         return NSImage(cgImage: cropped, size: selection.size)
@@ -329,8 +377,10 @@ private final class CaptureOverlayWindowController: NSWindowController {
 
     func show() {
         log("Capture overlay shown.")
+        NSApplication.shared.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
         window?.orderFrontRegardless()
+        window?.makeFirstResponder(overlayView)
     }
 
     private func cancel() {
@@ -385,6 +435,10 @@ private final class CaptureOverlayView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        setAccessibilityLabel("Screen capture area selector")
+        setAccessibilityHelp("Drag to capture an area. Press Return for the display under the pointer, or Escape to cancel.")
     }
 
     required init?(coder: NSCoder) {
@@ -392,6 +446,10 @@ private final class CaptureOverlayView: NSView {
     }
 
     override var acceptsFirstResponder: Bool { true }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .crosshair)
+    }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -429,6 +487,9 @@ private final class CaptureOverlayView: NSView {
 
     override func mouseUp(with event: NSEvent) {
         guard let selectionRect, selectionRect.width >= 4, selectionRect.height >= 4 else {
+            dragStart = nil
+            self.selectionRect = nil
+            needsDisplay = true
             return
         }
         onComplete?(selectionRect)
@@ -446,7 +507,7 @@ private final class CaptureOverlayView: NSView {
     }
 
     private func drawHint() {
-        let text = "Drag to capture area    Return full screen    Esc cancel"
+        let text = "Drag to capture    Return captures this display    Esc cancels"
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
             .foregroundColor: NSColor.white
@@ -486,24 +547,7 @@ private final class CaptureOverlayView: NSView {
         accent.lineWidth = 2
         accent.stroke()
 
-        drawCornerHandles(rect)
         drawSizeBadge(for: rect)
-    }
-
-    private func drawCornerHandles(_ rect: NSRect) {
-        let points = [
-            NSPoint(x: rect.minX, y: rect.minY),
-            NSPoint(x: rect.maxX, y: rect.minY),
-            NSPoint(x: rect.minX, y: rect.maxY),
-            NSPoint(x: rect.maxX, y: rect.maxY)
-        ]
-        for point in points {
-            let handle = NSRect(x: point.x - 4, y: point.y - 4, width: 8, height: 8)
-            NSColor.systemBlue.setFill()
-            NSBezierPath(roundedRect: handle, xRadius: 4, yRadius: 4).fill()
-            NSColor.white.setStroke()
-            NSBezierPath(roundedRect: handle.insetBy(dx: 0.5, dy: 0.5), xRadius: 4, yRadius: 4).stroke()
-        }
     }
 
     private func drawSizeBadge(for rect: NSRect) {
@@ -576,6 +620,21 @@ private enum MarkupTool: String, CaseIterable {
         case .text: return "Text"
         }
     }
+
+    var shortcut: String {
+        switch self {
+        case .select: return "V"
+        case .pen: return "P"
+        case .highlighter: return "H"
+        case .arrow: return "A"
+        case .rectangle: return "R"
+        case .ellipse: return "O"
+        case .mosaic: return "B"
+        case .marker: return "N"
+        case .check: return "K"
+        case .text: return "T"
+        }
+    }
 }
 
 private enum ShapeKind {
@@ -593,6 +652,114 @@ private enum Annotation {
     case text(String, origin: NSPoint, color: NSColor, fontSize: CGFloat, background: Bool)
 }
 
+private extension Annotation {
+    var bounds: NSRect {
+        switch self {
+        case let .stroke(points, _, width, _):
+            guard let first = points.first else { return .zero }
+            var minX = first.x
+            var maxX = first.x
+            var minY = first.y
+            var maxY = first.y
+            for point in points.dropFirst() {
+                minX = min(minX, point.x)
+                maxX = max(maxX, point.x)
+                minY = min(minY, point.y)
+                maxY = max(maxY, point.y)
+            }
+            return NSRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+                .insetBy(dx: -width / 2, dy: -width / 2)
+        case let .shape(kind, start, end, _, width):
+            let padding: CGFloat = switch kind {
+            case .arrow: max(width * 4.2, 14)
+            case .rectangle, .ellipse: width / 2
+            }
+            return normalizedRect(from: start, to: end).insetBy(dx: -padding, dy: -padding)
+        case let .mosaic(start, end, _):
+            return normalizedRect(from: start, to: end)
+        case let .marker(_, center, _), let .checkmark(center, _):
+            return NSRect(x: center.x - 14, y: center.y - 14, width: 28, height: 28)
+        case let .text(text, origin, _, fontSize, _):
+            let font = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
+            let size = text.size(withAttributes: [.font: font])
+            return NSRect(origin: origin, size: NSSize(width: size.width + 14, height: size.height + 10))
+        }
+    }
+
+    func hitTest(_ point: NSPoint, tolerance: CGFloat) -> Bool {
+        switch self {
+        case let .stroke(points, _, width, _):
+            guard points.count > 1 else { return false }
+            let threshold = max(tolerance, width / 2 + 3)
+            for index in 1..<points.count where MarkupGeometry.distance(
+                from: point,
+                toSegmentFrom: points[index - 1],
+                to: points[index]
+            ) <= threshold {
+                return true
+            }
+            return false
+        case let .shape(kind, start, end, _, width):
+            let threshold = max(tolerance, width / 2 + 3)
+            switch kind {
+            case .arrow:
+                return MarkupGeometry.distance(from: point, toSegmentFrom: start, to: end)
+                    <= threshold
+                    || hypot(point.x - end.x, point.y - end.y) <= max(14, width * 4.2) + tolerance
+            case .rectangle:
+                let rect = normalizedRect(from: start, to: end)
+                let corners = [
+                    NSPoint(x: rect.minX, y: rect.minY),
+                    NSPoint(x: rect.maxX, y: rect.minY),
+                    NSPoint(x: rect.maxX, y: rect.maxY),
+                    NSPoint(x: rect.minX, y: rect.maxY)
+                ]
+                return corners.indices.contains { index in
+                    MarkupGeometry.distance(
+                        from: point,
+                        toSegmentFrom: corners[index],
+                        to: corners[(index + 1) % corners.count]
+                    ) <= threshold
+                }
+            case .ellipse:
+                let rect = normalizedRect(from: start, to: end)
+                let radiusX = max(rect.width / 2, 0.001)
+                let radiusY = max(rect.height / 2, 0.001)
+                let normalizedDistance = hypot(
+                    (point.x - rect.midX) / radiusX,
+                    (point.y - rect.midY) / radiusY
+                )
+                return abs(normalizedDistance - 1) * min(radiusX, radiusY) <= threshold
+            }
+        case let .marker(_, center, _), let .checkmark(center, _):
+            return hypot(point.x - center.x, point.y - center.y) <= 14 + tolerance
+        case .mosaic, .text:
+            return MarkupGeometry.contains(point, in: bounds, tolerance: tolerance)
+        }
+    }
+
+    func translated(by delta: NSSize) -> Annotation {
+        func move(_ point: NSPoint) -> NSPoint {
+            NSPoint(x: point.x + delta.width, y: point.y + delta.height)
+        }
+
+        switch self {
+        case let .stroke(points, color, width, alpha):
+            return .stroke(points: points.map(move), color: color, width: width, alpha: alpha)
+        case let .shape(kind, start, end, color, width):
+            return .shape(kind: kind, start: move(start), end: move(end), color: color, width: width)
+        case let .mosaic(start, end, strength):
+            return .mosaic(start: move(start), end: move(end), strength: strength)
+        case let .marker(number, center, color):
+            return .marker(number: number, center: move(center), color: color)
+        case let .checkmark(center, color):
+            return .checkmark(center: move(center), color: color)
+        case let .text(text, origin, color, fontSize, background):
+            return .text(text, origin: move(origin), color: color, fontSize: fontSize, background: background)
+        }
+    }
+}
+
 private enum ZoomMode {
     case fit
     case fixed(CGFloat)
@@ -602,6 +769,7 @@ private enum EditorPreferences {
     private static let toolKey = "editor.lastTool"
     private static let colorKey = "editor.lastColor"
     private static let widthKey = "editor.lastWidth"
+    private static let fontSizeKey = "editor.lastFontSize"
 
     static var tool: MarkupTool {
         get {
@@ -655,6 +823,17 @@ private enum EditorPreferences {
             UserDefaults.standard.set(Double(min(24, max(1, newValue))), forKey: widthKey)
         }
     }
+
+    static var fontSize: CGFloat {
+        get {
+            let storedSize = UserDefaults.standard.double(forKey: fontSizeKey)
+            guard storedSize > 0 else { return 28 }
+            return min(96, max(12, CGFloat(storedSize)))
+        }
+        set {
+            UserDefaults.standard.set(Double(min(96, max(12, newValue))), forKey: fontSizeKey)
+        }
+    }
 }
 
 private final class ImageEditorWindowController: NSWindowController, NSWindowDelegate {
@@ -677,8 +856,8 @@ private final class ImageEditorWindowController: NSWindowController, NSWindowDel
             defer: false
         )
         let captureTime = Self.titleTimeFormatter.string(from: Date())
-        window.title = "\(captureTime) \(Int(image.size.width))x\(Int(image.size.height))"
-        window.minSize = NSSize(width: 1080, height: 640)
+        window.title = "Screenshot · \(captureTime) · \(Int(image.size.width)) × \(Int(image.size.height))"
+        window.minSize = NSSize(width: 900, height: 620)
         window.level = .normal
         window.tabbingIdentifier = "ScreenshotQuickMarkup.Editor"
         window.tabbingMode = .preferred
@@ -688,13 +867,19 @@ private final class ImageEditorWindowController: NSWindowController, NSWindowDel
         super.init(window: window)
         window.delegate = self
         window.onCommandSave = { [weak self] in self?.saveImage() }
-        window.onCommandCopy = { [weak self] in self?.copyImageToClipboard() }
+        window.onCommandCopy = { [weak self] in _ = self?.copyImageToClipboard() }
         window.onUndo = { [weak self] in self?.editorViewController.undo() }
         window.onRedo = { [weak self] in self?.editorViewController.redo() }
-        editorViewController.onCopy = { [weak self] in self?.copyImageToClipboard() }
+        window.onToolShortcut = { [weak self] tool in
+            self?.editorViewController.activateTool(tool)
+        }
+        editorViewController.onCopy = { [weak self] in
+            _ = self?.copyImageToClipboard()
+        }
         editorViewController.onSave = { [weak self] in self?.saveImage() }
         editorViewController.onDone = { [weak self] in
-            self?.window?.close()
+            guard let self, self.copyImageToClipboard() else { return }
+            self.window?.close()
         }
     }
 
@@ -706,24 +891,45 @@ private final class ImageEditorWindowController: NSWindowController, NSWindowDel
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
         window?.orderFrontRegardless()
+        focusCanvas()
+    }
+
+    func focusCanvas() {
+        editorViewController.focusCanvas()
     }
 
     func windowWillClose(_ notification: Notification) {
-        copyImageToClipboard()
         onClose?()
     }
 
-    private func copyImageToClipboard() {
-        guard let data = editorViewController.renderedPNGData() else { return }
+    @discardableResult
+    private func copyImageToClipboard() -> Bool {
+        guard let data = editorViewController.renderedPNGData() else {
+            editorViewController.showStatus("Couldn’t render image", isError: true)
+            return false
+        }
+        let item = NSPasteboardItem()
+        guard item.setData(data, forType: .png) else {
+            editorViewController.showStatus("Couldn’t prepare image for copying", isError: true)
+            return false
+        }
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        pasteboard.setData(data, forType: .png)
+        guard pasteboard.writeObjects([item]) else {
+            editorViewController.showStatus("Couldn’t copy image", isError: true)
+            return false
+        }
         NSSound(named: "Pop")?.play()
+        editorViewController.showStatus("Copied to clipboard")
         log("Copied edited screenshot to clipboard.")
+        return true
     }
 
     private func saveImage() {
-        guard let data = editorViewController.renderedPNGData() else { return }
+        guard let data = editorViewController.renderedPNGData() else {
+            editorViewController.showStatus("Couldn’t render image", isError: true)
+            return
+        }
         NSApplication.shared.activate(ignoringOtherApps: true)
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "screenshot-\(Int(Date().timeIntervalSince1970)).png"
@@ -732,8 +938,11 @@ private final class ImageEditorWindowController: NSWindowController, NSWindowDel
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
             try data.write(to: url)
+            editorViewController.showStatus("Saved \(url.lastPathComponent)")
+            NSSound(named: "Pop")?.play()
         } catch {
             log("Failed to save screenshot: \(error.localizedDescription)")
+            editorViewController.showStatus("Save failed: \(error.localizedDescription)", isError: true)
         }
     }
 }
@@ -744,7 +953,7 @@ private func editorWindowSize(for imageSize: NSSize) -> NSSize {
         width: max(900, screenFrame.width * 0.82),
         height: max(640, screenFrame.height * 0.82)
     )
-    let minSize = NSSize(width: 1100, height: 760)
+    let minSize = NSSize(width: 920, height: 680)
     let preferredScale = calculatePreviewScale(for: imageSize, viewportSize: maxSize)
 
     return NSSize(
@@ -758,13 +967,33 @@ private final class EditorWindow: NSWindow {
     var onCommandCopy: (() -> Void)?
     var onUndo: (() -> Void)?
     var onRedo: (() -> Void)?
+    var onToolShortcut: ((MarkupTool) -> Void)?
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown,
+           !(firstResponder is NSTextView),
+           event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+           let character = event.charactersIgnoringModifiers?.uppercased(),
+           let tool = MarkupTool.allCases.first(where: { $0.shortcut == character }) {
+            onToolShortcut?(tool)
+            return
+        }
+        super.sendEvent(event)
+    }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         guard event.modifierFlags.contains(.command) else {
             return super.performKeyEquivalent(with: event)
         }
 
+        if firstResponder is NSTextView, [6, 7, 8, 9].contains(Int(event.keyCode)) {
+            return super.performKeyEquivalent(with: event)
+        }
+
         switch Int(event.keyCode) {
+        case 13:
+            performClose(nil)
+            return true
         case 1:
             onCommandSave?()
             return true
@@ -794,12 +1023,33 @@ private final class ImageEditorViewController: NSViewController {
     private let toolButtons = NSStackView()
     private let colorSwatches = NSStackView()
     private let zoomButtons = NSStackView()
+    private let historyButtons = NSStackView()
     private let scrollView = NSScrollView()
     private let colorWell = NSColorWell()
+    private let colorControls = NSStackView()
+    private let widthControls = NSStackView()
+    private let fontControls = NSStackView()
     private let widthLabel = NSTextField(labelWithString: "Size")
     private let widthValueLabel = NSTextField(labelWithString: "4")
     private let widthSlider = NSSlider(value: 4, minValue: 1, maxValue: 24, target: nil, action: nil)
     private let fontSizeSlider = NSSlider(value: 28, minValue: 12, maxValue: 96, target: nil, action: nil)
+    private let fontSizeValueLabel = NSTextField(labelWithString: "28")
+    private let statusLabel = NSTextField(labelWithString: "")
+    private lazy var undoButton = compactButton(
+        symbolName: "arrow.uturn.backward",
+        action: #selector(undoTapped),
+        tooltip: "Undo (⌘Z)"
+    )
+    private lazy var redoButton = compactButton(
+        symbolName: "arrow.uturn.forward",
+        action: #selector(redoTapped),
+        tooltip: "Redo (⌘⇧Z)"
+    )
+    private lazy var deleteButton = compactButton(
+        symbolName: "trash",
+        action: #selector(deleteTapped),
+        tooltip: "Delete selected annotation (⌫)"
+    )
 
     init(image: NSImage) {
         self.image = image
@@ -824,22 +1074,31 @@ private final class ImageEditorViewController: NSViewController {
         toolbar.translatesAutoresizingMaskIntoConstraints = false
 
         toolButtons.orientation = .horizontal
-        toolButtons.spacing = 3
+        toolButtons.spacing = 4
         toolButtons.translatesAutoresizingMaskIntoConstraints = false
 
         for tool in MarkupTool.allCases {
             let button = ToolButton(tool: tool)
             button.target = self
             button.action = #selector(selectTool(_:))
-            button.toolTip = tool.title
+            button.toolTip = "\(tool.title) (\(tool.shortcut))"
             toolButtons.addArrangedSubview(button)
         }
 
         colorSwatches.orientation = .horizontal
-        colorSwatches.spacing = 3
+        colorSwatches.spacing = 4
         colorSwatches.translatesAutoresizingMaskIntoConstraints = false
-        for color in [NSColor.systemRed, .systemYellow, .systemGreen, .systemBlue, .systemPurple, .white, .black] {
-            let swatch = ColorSwatchButton(color: color)
+        let colors: [(String, NSColor)] = [
+            ("Red", .systemRed),
+            ("Yellow", .systemYellow),
+            ("Green", .systemGreen),
+            ("Blue", .systemBlue),
+            ("Purple", .systemPurple),
+            ("White", .white),
+            ("Black", .black)
+        ]
+        for (name, color) in colors {
+            let swatch = ColorSwatchButton(name: name, color: color)
             swatch.target = self
             swatch.action = #selector(selectSwatch(_:))
             colorSwatches.addArrangedSubview(swatch)
@@ -848,27 +1107,31 @@ private final class ImageEditorViewController: NSViewController {
         colorWell.color = EditorPreferences.color
         colorWell.target = self
         colorWell.action = #selector(styleChanged)
+        colorWell.toolTip = "Custom color"
+        colorWell.setAccessibilityLabel("Custom annotation color")
         colorWell.translatesAutoresizingMaskIntoConstraints = false
 
-        widthLabel.font = .systemFont(ofSize: 11, weight: .semibold)
-        widthLabel.textColor = .secondaryLabelColor
-        widthLabel.alignment = .right
-        widthLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        widthValueLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        widthValueLabel.textColor = .secondaryLabelColor
-        widthValueLabel.alignment = .left
-        widthValueLabel.translatesAutoresizingMaskIntoConstraints = false
+        configureOptionLabel(widthLabel)
+        configureValueLabel(widthValueLabel)
+        configureValueLabel(fontSizeValueLabel)
 
         widthSlider.doubleValue = Double(EditorPreferences.width)
         widthSlider.target = self
         widthSlider.action = #selector(styleChanged)
         widthSlider.toolTip = "Stroke width / blur strength"
+        widthSlider.setAccessibilityLabel("Annotation size")
         widthSlider.translatesAutoresizingMaskIntoConstraints = false
 
+        fontSizeSlider.doubleValue = Double(EditorPreferences.fontSize)
         fontSizeSlider.target = self
         fontSizeSlider.action = #selector(styleChanged)
+        fontSizeSlider.toolTip = "Text size"
+        fontSizeSlider.setAccessibilityLabel("Text size")
         fontSizeSlider.translatesAutoresizingMaskIntoConstraints = false
+
+        configureOptionStack(colorControls, views: [optionLabel("Color"), colorSwatches, colorWell])
+        configureOptionStack(widthControls, views: [widthLabel, widthSlider, widthValueLabel])
+        configureOptionStack(fontControls, views: [optionLabel("Text"), fontSizeSlider, fontSizeValueLabel])
 
         zoomButtons.orientation = .horizontal
         zoomButtons.spacing = 4
@@ -878,77 +1141,91 @@ private final class ImageEditorViewController: NSViewController {
         zoomButtons.addArrangedSubview(zoomButton(title: "Fit", action: #selector(fitTapped), tooltip: "Fit to window"))
         zoomButtons.addArrangedSubview(zoomButton(title: "+", action: #selector(zoomInTapped), tooltip: "Zoom in"))
 
-        let copyButton = toolbarButton(title: "Copy", symbolName: "doc.on.doc", action: #selector(copyTapped))
-        let saveButton = toolbarButton(title: "Save", symbolName: "square.and.arrow.down", action: #selector(saveTapped))
-        let doneButton = toolbarButton(title: "Done", symbolName: "checkmark.circle.fill", action: #selector(doneTapped))
+        historyButtons.orientation = .horizontal
+        historyButtons.spacing = 4
+        historyButtons.translatesAutoresizingMaskIntoConstraints = false
+        historyButtons.addArrangedSubview(undoButton)
+        historyButtons.addArrangedSubview(redoButton)
+        historyButtons.addArrangedSubview(deleteButton)
+
+        let copyButton = toolbarButton(
+            title: "Copy",
+            symbolName: "doc.on.doc",
+            action: #selector(copyTapped),
+            width: 78
+        )
+        let saveButton = toolbarButton(
+            title: "Save",
+            symbolName: "square.and.arrow.down",
+            action: #selector(saveTapped),
+            width: 76
+        )
+        let doneButton = toolbarButton(
+            title: "Copy & Close",
+            symbolName: "checkmark.circle.fill",
+            action: #selector(doneTapped),
+            width: 128
+        )
         doneButton.contentTintColor = .controlAccentColor
+        doneButton.toolTip = "Copy edited image and close window"
+
+        let topSpacer = flexibleSpacer()
+        let topRow = NSStackView(views: [toolButtons, topSpacer, historyButtons, copyButton, saveButton, doneButton])
+        topRow.orientation = .horizontal
+        topRow.alignment = .centerY
+        topRow.spacing = 8
+        topRow.translatesAutoresizingMaskIntoConstraints = false
+
+        statusLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.alignment = .right
+        statusLabel.lineBreakMode = .byTruncatingMiddle
+        statusLabel.setAccessibilityLabel("Editor status")
+        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let bottomSpacer = flexibleSpacer()
+        let bottomRow = NSStackView(views: [colorControls, widthControls, fontControls, zoomButtons, bottomSpacer, statusLabel])
+        bottomRow.orientation = .horizontal
+        bottomRow.alignment = .centerY
+        bottomRow.spacing = 14
+        bottomRow.translatesAutoresizingMaskIntoConstraints = false
 
         scrollView.documentView = canvasView
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = true
-        scrollView.autohidesScrollers = false
+        scrollView.autohidesScrollers = true
         scrollView.borderType = .noBorder
+        scrollView.backgroundColor = .black
         scrollView.translatesAutoresizingMaskIntoConstraints = false
 
         root.addSubview(toolbar)
-        toolbar.addSubview(toolButtons)
-        toolbar.addSubview(colorSwatches)
-        toolbar.addSubview(colorWell)
-        toolbar.addSubview(widthLabel)
-        toolbar.addSubview(widthSlider)
-        toolbar.addSubview(widthValueLabel)
-        toolbar.addSubview(fontSizeSlider)
-        toolbar.addSubview(zoomButtons)
-        toolbar.addSubview(copyButton)
-        toolbar.addSubview(saveButton)
-        toolbar.addSubview(doneButton)
+        toolbar.addSubview(topRow)
+        toolbar.addSubview(bottomRow)
         root.addSubview(scrollView)
 
         NSLayoutConstraint.activate([
             toolbar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             toolbar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             toolbar.topAnchor.constraint(equalTo: root.topAnchor),
-            toolbar.heightAnchor.constraint(equalToConstant: 56),
+            toolbar.heightAnchor.constraint(equalToConstant: 94),
 
-            toolButtons.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: 12),
-            toolButtons.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
+            topRow.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: 12),
+            topRow.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -12),
+            topRow.topAnchor.constraint(equalTo: toolbar.topAnchor, constant: 8),
+            topRow.heightAnchor.constraint(equalToConstant: 34),
 
-            colorSwatches.leadingAnchor.constraint(equalTo: toolButtons.trailingAnchor, constant: 16),
-            colorSwatches.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
+            bottomRow.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: 14),
+            bottomRow.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -14),
+            bottomRow.topAnchor.constraint(equalTo: topRow.bottomAnchor, constant: 8),
+            bottomRow.heightAnchor.constraint(equalToConstant: 30),
 
-            colorWell.leadingAnchor.constraint(equalTo: colorSwatches.trailingAnchor, constant: 8),
-            colorWell.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
             colorWell.widthAnchor.constraint(equalToConstant: 32),
-            colorWell.heightAnchor.constraint(equalToConstant: 26),
-
-            widthLabel.leadingAnchor.constraint(equalTo: colorWell.trailingAnchor, constant: 10),
-            widthLabel.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
-            widthLabel.widthAnchor.constraint(equalToConstant: 34),
-
-            widthSlider.leadingAnchor.constraint(equalTo: widthLabel.trailingAnchor, constant: 6),
-            widthSlider.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
-            widthSlider.widthAnchor.constraint(equalToConstant: 78),
-
-            widthValueLabel.leadingAnchor.constraint(equalTo: widthSlider.trailingAnchor, constant: 6),
-            widthValueLabel.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
+            colorWell.heightAnchor.constraint(equalToConstant: 24),
+            widthSlider.widthAnchor.constraint(equalToConstant: 86),
             widthValueLabel.widthAnchor.constraint(equalToConstant: 24),
-
-            fontSizeSlider.leadingAnchor.constraint(equalTo: widthValueLabel.trailingAnchor, constant: 12),
-            fontSizeSlider.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
-            fontSizeSlider.widthAnchor.constraint(equalToConstant: 78),
-
-            zoomButtons.leadingAnchor.constraint(equalTo: fontSizeSlider.trailingAnchor, constant: 14),
-            zoomButtons.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
-
-            doneButton.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -12),
-            doneButton.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
-
-            saveButton.trailingAnchor.constraint(equalTo: doneButton.leadingAnchor, constant: -8),
-            saveButton.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
-
-            copyButton.trailingAnchor.constraint(equalTo: saveButton.leadingAnchor, constant: -8),
-            copyButton.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
-            copyButton.leadingAnchor.constraint(greaterThanOrEqualTo: zoomButtons.trailingAnchor, constant: 14),
+            fontSizeSlider.widthAnchor.constraint(equalToConstant: 86),
+            fontSizeValueLabel.widthAnchor.constraint(equalToConstant: 28),
+            statusLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 90),
 
             scrollView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
@@ -957,9 +1234,20 @@ private final class ImageEditorViewController: NSViewController {
         ])
 
         view = root
-        canvasView.tool = EditorPreferences.tool
+        canvasView.onHistoryChanged = { [weak self] canUndo, canRedo in
+            self?.updateHistoryControls(canUndo: canUndo, canRedo: canRedo)
+        }
+        canvasView.onSelectionChanged = { [weak self] hasSelection in
+            self?.deleteButton.isEnabled = hasSelection
+        }
+        canvasView.onToolShortcut = { [weak self] tool in
+            self?.setTool(tool)
+        }
+        setTool(EditorPreferences.tool, focusCanvas: false)
         updateSelectedToolButtons()
         styleChanged()
+        updateHistoryControls(canUndo: false, canRedo: false)
+        deleteButton.isEnabled = false
     }
 
     override func viewDidLayout() {
@@ -979,10 +1267,26 @@ private final class ImageEditorViewController: NSViewController {
         canvasView.renderedPNGData()
     }
 
+    func focusCanvas() {
+        loadViewIfNeeded()
+        view.window?.makeFirstResponder(canvasView)
+    }
+
+    func activateTool(_ tool: MarkupTool) {
+        loadViewIfNeeded()
+        setTool(tool)
+    }
+
+    func showStatus(_ message: String, isError: Bool = false) {
+        NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(clearStatus), object: nil)
+        statusLabel.stringValue = message
+        statusLabel.textColor = isError ? .systemRed : .secondaryLabelColor
+        statusLabel.toolTip = message
+        perform(#selector(clearStatus), with: nil, afterDelay: isError ? 5 : 2.5)
+    }
+
     @objc private func selectTool(_ sender: ToolButton) {
-        canvasView.tool = sender.tool
-        EditorPreferences.tool = sender.tool
-        updateSelectedToolButtons()
+        setTool(sender.tool)
     }
 
     @objc private func styleChanged() {
@@ -991,7 +1295,9 @@ private final class ImageEditorViewController: NSViewController {
         canvasView.currentFontSize = CGFloat(fontSizeSlider.doubleValue)
         EditorPreferences.color = colorWell.color
         EditorPreferences.width = CGFloat(widthSlider.doubleValue)
+        EditorPreferences.fontSize = CGFloat(fontSizeSlider.doubleValue)
         updateStyleLabels()
+        updateSelectedColorSwatches()
     }
 
     @objc private func selectSwatch(_ sender: ColorSwatchButton) {
@@ -1011,6 +1317,18 @@ private final class ImageEditorViewController: NSViewController {
         onDone?()
     }
 
+    @objc private func undoTapped() {
+        undo()
+    }
+
+    @objc private func redoTapped() {
+        redo()
+    }
+
+    @objc private func deleteTapped() {
+        canvasView.deleteSelectedAnnotation()
+    }
+
     @objc private func zoomOutTapped() {
         canvasView.zoomOut(in: scrollView.contentView.bounds.size)
     }
@@ -1027,17 +1345,44 @@ private final class ImageEditorViewController: NSViewController {
         canvasView.zoomIn(in: scrollView.contentView.bounds.size)
     }
 
-    private func toolbarButton(title: String, symbolName: String, action: Selector) -> NSButton {
-        let button = NSButton(title: "", target: self, action: action)
+    @objc private func clearStatus() {
+        statusLabel.stringValue = ""
+        statusLabel.toolTip = nil
+    }
+
+    private func toolbarButton(
+        title: String,
+        symbolName: String,
+        action: Selector,
+        width: CGFloat
+    ) -> NSButton {
+        let button = NSButton(title: title, target: self, action: action)
         button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: title)
-        button.imagePosition = .imageOnly
+        button.imagePosition = .imageLeading
         button.bezelStyle = .rounded
         button.controlSize = .regular
         button.font = .systemFont(ofSize: 12, weight: .medium)
         button.toolTip = title
+        button.setAccessibilityLabel(title)
         button.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            button.widthAnchor.constraint(equalToConstant: 36),
+            button.widthAnchor.constraint(equalToConstant: width),
+            button.heightAnchor.constraint(equalToConstant: 32)
+        ])
+        return button
+    }
+
+    private func compactButton(symbolName: String, action: Selector, tooltip: String) -> NSButton {
+        let button = NSButton(title: "", target: self, action: action)
+        button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: tooltip)
+        button.imagePosition = .imageOnly
+        button.bezelStyle = .rounded
+        button.controlSize = .regular
+        button.toolTip = tooltip
+        button.setAccessibilityLabel(tooltip)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: 32),
             button.heightAnchor.constraint(equalToConstant: 32)
         ])
         return button
@@ -1049,6 +1394,7 @@ private final class ImageEditorViewController: NSViewController {
         button.controlSize = .small
         button.font = .systemFont(ofSize: 11, weight: .medium)
         button.toolTip = tooltip
+        button.setAccessibilityLabel(tooltip)
         button.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             button.heightAnchor.constraint(equalToConstant: 28),
@@ -1067,6 +1413,90 @@ private final class ImageEditorViewController: NSViewController {
     private func updateStyleLabels() {
         widthLabel.stringValue = canvasView.tool == .mosaic ? "Blur" : "Size"
         widthValueLabel.stringValue = "\(Int(widthSlider.doubleValue.rounded()))"
+        fontSizeValueLabel.stringValue = "\(Int(fontSizeSlider.doubleValue.rounded()))"
+
+        switch canvasView.tool {
+        case .select:
+            colorControls.isHidden = true
+            widthControls.isHidden = true
+            fontControls.isHidden = true
+        case .mosaic:
+            colorControls.isHidden = true
+            widthControls.isHidden = false
+            fontControls.isHidden = true
+        case .text:
+            colorControls.isHidden = false
+            widthControls.isHidden = true
+            fontControls.isHidden = false
+        case .marker, .check:
+            colorControls.isHidden = false
+            widthControls.isHidden = true
+            fontControls.isHidden = true
+        case .pen, .highlighter, .arrow, .rectangle, .ellipse:
+            colorControls.isHidden = false
+            widthControls.isHidden = false
+            fontControls.isHidden = true
+        }
+    }
+
+    private func setTool(_ tool: MarkupTool, focusCanvas: Bool = true) {
+        canvasView.tool = tool
+        EditorPreferences.tool = tool
+        updateSelectedToolButtons()
+        if focusCanvas {
+            view.window?.makeFirstResponder(canvasView)
+        }
+        if tool == .select {
+            showStatus("Click an annotation to move or delete it")
+        }
+    }
+
+    private func updateHistoryControls(canUndo: Bool, canRedo: Bool) {
+        undoButton.isEnabled = canUndo
+        redoButton.isEnabled = canRedo
+    }
+
+    private func updateSelectedColorSwatches() {
+        for case let swatch as ColorSwatchButton in colorSwatches.arrangedSubviews {
+            swatch.isSelectedColor = swatch.color.isEqual(colorWell.color)
+        }
+    }
+
+    private func configureOptionStack(_ stack: NSStackView, views: [NSView]) {
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 6
+        for view in views {
+            stack.addArrangedSubview(view)
+        }
+        stack.translatesAutoresizingMaskIntoConstraints = false
+    }
+
+    private func optionLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        configureOptionLabel(label)
+        return label
+    }
+
+    private func configureOptionLabel(_ label: NSTextField) {
+        label.font = .systemFont(ofSize: 11, weight: .semibold)
+        label.textColor = .secondaryLabelColor
+        label.alignment = .right
+        label.translatesAutoresizingMaskIntoConstraints = false
+    }
+
+    private func configureValueLabel(_ label: NSTextField) {
+        label.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        label.textColor = .secondaryLabelColor
+        label.alignment = .left
+        label.translatesAutoresizingMaskIntoConstraints = false
+    }
+
+    private func flexibleSpacer() -> NSView {
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return spacer
     }
 }
 
@@ -1080,6 +1510,8 @@ private final class ToolButton: NSButton {
             layer?.backgroundColor = isSelectedTool
                 ? NSColor.controlAccentColor.withAlphaComponent(0.25).cgColor
                 : NSColor.clear.cgColor
+            state = isSelectedTool ? .on : .off
+            setAccessibilityValue(isSelectedTool ? "Selected" : "Not selected")
         }
     }
 
@@ -1090,6 +1522,10 @@ private final class ToolButton: NSButton {
         imagePosition = .imageOnly
         bezelStyle = .rounded
         isBordered = false
+        title = ""
+        setButtonType(.toggle)
+        setAccessibilityLabel("\(tool.title) tool")
+        setAccessibilityHelp("Keyboard shortcut \(tool.shortcut)")
         translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             widthAnchor.constraint(equalToConstant: 30),
@@ -1105,16 +1541,30 @@ private final class ToolButton: NSButton {
 private final class ColorSwatchButton: NSButton {
     let color: NSColor
 
-    init(color: NSColor) {
+    var isSelectedColor = false {
+        didSet {
+            layer?.borderWidth = isSelectedColor ? 3 : 1
+            layer?.borderColor = isSelectedColor
+                ? NSColor.controlAccentColor.cgColor
+                : NSColor.separatorColor.cgColor
+            state = isSelectedColor ? .on : .off
+            setAccessibilityValue(isSelectedColor ? "Selected" : "Not selected")
+        }
+    }
+
+    init(name: String, color: NSColor) {
         self.color = color
         super.init(frame: .zero)
+        title = ""
         isBordered = false
+        setButtonType(.toggle)
         wantsLayer = true
         layer?.cornerRadius = 6
         layer?.borderWidth = 1
         layer?.borderColor = NSColor.separatorColor.cgColor
         layer?.backgroundColor = color.cgColor
-        toolTip = "Use color"
+        toolTip = "Use \(name.lowercased())"
+        setAccessibilityLabel("\(name) annotation color")
         translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             widthAnchor.constraint(equalToConstant: 18),
@@ -1128,30 +1578,74 @@ private final class ColorSwatchButton: NSButton {
 }
 
 private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
+    var onHistoryChanged: ((Bool, Bool) -> Void)?
+    var onSelectionChanged: ((Bool) -> Void)?
+    var onToolShortcut: ((MarkupTool) -> Void)?
+
     let image: NSImage
-    var tool: MarkupTool = .pen
+    var tool: MarkupTool = .pen {
+        didSet {
+            if tool != .text {
+                commitActiveText()
+            }
+            if tool != .select {
+                setSelectedAnnotation(nil)
+            }
+            window?.invalidateCursorRects(for: self)
+            needsDisplay = true
+        }
+    }
     var currentColor: NSColor = .systemRed
     var currentWidth: CGFloat = 4
     var currentFontSize: CGFloat = 28
 
     private var annotations: [Annotation] = []
-    private var redoStack: [Annotation] = []
+    private var undoStack: [[Annotation]] = []
+    private var redoStack: [[Annotation]] = []
     private var currentStrokePoints: [NSPoint] = []
     private var currentShapeStart: NSPoint?
     private var currentShapeEnd: NSPoint?
     private var activeTextField: NSTextField?
     private var activeTextOrigin: NSPoint?
+    private var selectedAnnotationIndex: Int?
+    private var selectionDragStart: NSPoint?
+    private var selectionDragOriginalAnnotation: Annotation?
+    private var selectionDragOriginalState: [Annotation]?
+    private var selectionDidMove = false
     private var previewScale: CGFloat = 1
     private var zoomMode: ZoomMode = .fit
     private var lastContainerSize = NSSize(width: 980, height: 654)
+    private let outputPixelSize: NSSize
+    private var mosaicCache: [MosaicCacheKey: NSImage] = [:]
+
+    private struct MosaicCacheKey: Hashable {
+        let sourceX: Int
+        let sourceY: Int
+        let sourceWidth: Int
+        let sourceHeight: Int
+        let pixelWidth: Int
+        let pixelHeight: Int
+        let strength: Int
+    }
 
     override var isFlipped: Bool { true }
 
     init(image: NSImage) {
         self.image = image
+        if let representation = image.representations.max(by: {
+            $0.pixelsWide * $0.pixelsHigh < $1.pixelsWide * $1.pixelsHigh
+        }), representation.pixelsWide > 0, representation.pixelsHigh > 0 {
+            outputPixelSize = NSSize(width: representation.pixelsWide, height: representation.pixelsHigh)
+        } else {
+            outputPixelSize = image.size
+        }
         super.init(frame: NSRect(origin: .zero, size: image.size))
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        setAccessibilityLabel("Screenshot markup canvas")
+        setAccessibilityHelp("Use tool shortcuts to annotate. Select an annotation to move or delete it.")
         updateCanvasSize(NSSize(width: 980, height: 654))
     }
 
@@ -1160,6 +1654,15 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
     }
 
     override var acceptsFirstResponder: Bool { true }
+
+    override func resetCursorRects() {
+        let cursor: NSCursor = switch tool {
+        case .select: .openHand
+        case .text: .iBeam
+        default: .crosshair
+        }
+        addCursorRect(imageRect, cursor: cursor)
+    }
 
     func updateCanvasSize(_ containerSize: NSSize) {
         lastContainerSize = containerSize
@@ -1222,6 +1725,7 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
             draw(annotation, transform: transform)
         }
         drawInProgress(transform: transform)
+        drawSelectionOverlay(transform: transform)
         NSGraphicsContext.restoreGraphicsState()
     }
 
@@ -1229,6 +1733,11 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
         window?.makeFirstResponder(self)
         let point = imagePoint(from: convert(event.locationInWindow, from: nil))
         guard point != nil else { return }
+
+        if tool == .select {
+            beginSelection(at: point!)
+            return
+        }
 
         if event.clickCount >= 2 || tool == .text {
             beginTextEditing(at: point!)
@@ -1257,6 +1766,11 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
         guard let point = imagePoint(from: convert(event.locationInWindow, from: nil)) else { return }
         switch tool {
         case .pen, .highlighter:
+            let minimumDistance = max(0.75, currentWidth * 0.15)
+            if let last = currentStrokePoints.last,
+               hypot(point.x - last.x, point.y - last.y) < minimumDistance {
+                return
+            }
             currentStrokePoints.append(point)
             needsDisplay = true
         case .arrow, .rectangle, .ellipse:
@@ -1265,12 +1779,19 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
         case .mosaic:
             currentShapeEnd = point
             needsDisplay = true
-        case .select, .marker, .check, .text:
+        case .select:
+            moveSelection(to: point)
+        case .marker, .check, .text:
             break
         }
     }
 
     override func mouseUp(with event: NSEvent) {
+        if tool == .select {
+            finishSelectionMove()
+            return
+        }
+
         defer {
             currentStrokePoints = []
             currentShapeStart = nil
@@ -1298,26 +1819,118 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
         }
     }
 
+    override func keyDown(with event: NSEvent) {
+        let keyCode = Int(event.keyCode)
+        switch keyCode {
+        case 51, 117:
+            deleteSelectedAnnotation()
+            return
+        case 53:
+            if activeTextField != nil {
+                cancelActiveText()
+            } else if selectedAnnotationIndex != nil {
+                setSelectedAnnotation(nil)
+            } else {
+                cancelInProgressAnnotation()
+            }
+            return
+        case 123, 124, 125, 126:
+            guard selectedAnnotationIndex != nil else { break }
+            let distance: CGFloat = event.modifierFlags.contains(.shift) ? 10 : 1
+            let delta: NSSize = switch keyCode {
+            case 123: NSSize(width: -distance, height: 0)
+            case 124: NSSize(width: distance, height: 0)
+            case 125: NSSize(width: 0, height: distance)
+            default: NSSize(width: 0, height: -distance)
+            }
+            nudgeSelectedAnnotation(by: delta)
+            return
+        default:
+            break
+        }
+
+        let disallowedModifiers: NSEvent.ModifierFlags = [.command, .control, .option]
+        if event.modifierFlags.intersection(disallowedModifiers).isEmpty,
+           let character = event.charactersIgnoringModifiers?.uppercased(),
+           let shortcutTool = MarkupTool.allCases.first(where: { $0.shortcut == character }) {
+            onToolShortcut?(shortcutTool)
+            return
+        }
+
+        super.keyDown(with: event)
+    }
+
     func undo() {
-        guard let last = annotations.popLast() else { return }
-        redoStack.append(last)
+        commitActiveText()
+        guard let previous = undoStack.popLast() else { return }
+        redoStack.append(annotations)
+        annotations = previous
+        setSelectedAnnotation(nil)
+        notifyHistoryChanged()
         needsDisplay = true
     }
 
     func redo() {
-        guard let last = redoStack.popLast() else { return }
-        annotations.append(last)
+        commitActiveText()
+        guard let next = redoStack.popLast() else { return }
+        undoStack.append(annotations)
+        annotations = next
+        setSelectedAnnotation(nil)
+        notifyHistoryChanged()
+        needsDisplay = true
+    }
+
+    func deleteSelectedAnnotation() {
+        guard let selectedAnnotationIndex, annotations.indices.contains(selectedAnnotationIndex) else { return }
+        recordStateForUndo()
+        annotations.remove(at: selectedAnnotationIndex)
+        setSelectedAnnotation(nil)
         needsDisplay = true
     }
 
     func renderedPNGData() -> Data? {
         commitActiveText()
-        guard let rendered = renderedImage(),
-              let tiff = rendered.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiff)
+        let pixelWidth = max(1, Int(outputPixelSize.width.rounded()))
+        let pixelHeight = max(1, Int(outputPixelSize.height.rounded()))
+        guard image.size.width > 0,
+              image.size.height > 0,
+              let bitmap = NSBitmapImageRep(
+                  bitmapDataPlanes: nil,
+                  pixelsWide: pixelWidth,
+                  pixelsHigh: pixelHeight,
+                  bitsPerSample: 8,
+                  samplesPerPixel: 4,
+                  hasAlpha: true,
+                  isPlanar: false,
+                  colorSpaceName: .deviceRGB,
+                  bitmapFormat: [],
+                  bytesPerRow: 0,
+                  bitsPerPixel: 0
+              ),
+              let bitmapContext = NSGraphicsContext(bitmapImageRep: bitmap)
         else {
             return nil
         }
+
+        let scaleX = CGFloat(pixelWidth) / image.size.width
+        let scaleY = CGFloat(pixelHeight) / image.size.height
+        bitmapContext.cgContext.translateBy(x: 0, y: CGFloat(pixelHeight))
+        bitmapContext.cgContext.scaleBy(x: scaleX, y: -scaleY)
+        let context = NSGraphicsContext(cgContext: bitmapContext.cgContext, flipped: true)
+        let previousContext = NSGraphicsContext.current
+        NSGraphicsContext.current = context
+        NSGraphicsContext.saveGraphicsState()
+        defer {
+            NSGraphicsContext.restoreGraphicsState()
+            NSGraphicsContext.current = previousContext
+        }
+
+        context.imageInterpolation = .high
+        image.draw(in: NSRect(origin: .zero, size: image.size))
+        for annotation in annotations {
+            drawForExport(annotation, transform: { $0 })
+        }
+
         return bitmap.representation(using: .png, properties: [:])
     }
 
@@ -1358,8 +1971,113 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
     }
 
     private func append(_ annotation: Annotation) {
+        recordStateForUndo()
         annotations.append(annotation)
+        needsDisplay = true
+    }
+
+    private func beginSelection(at point: NSPoint) {
+        let tolerance = 8 / max(previewScale, 0.1)
+        let hitIndex = annotations.indices.reversed().first {
+            annotations[$0].hitTest(point, tolerance: tolerance)
+        }
+        setSelectedAnnotation(hitIndex)
+        guard let hitIndex else { return }
+        selectionDragStart = point
+        selectionDragOriginalAnnotation = annotations[hitIndex]
+        selectionDragOriginalState = annotations
+        selectionDidMove = false
+    }
+
+    private func moveSelection(to point: NSPoint) {
+        guard let selectedAnnotationIndex,
+              annotations.indices.contains(selectedAnnotationIndex),
+              let dragStart = selectionDragStart,
+              let original = selectionDragOriginalAnnotation
+        else {
+            return
+        }
+
+        let proposed = NSSize(width: point.x - dragStart.x, height: point.y - dragStart.y)
+        let delta = clampedTranslation(for: original, proposed: proposed)
+        annotations[selectedAnnotationIndex] = original.translated(by: delta)
+        selectionDidMove = abs(delta.width) > 0.01 || abs(delta.height) > 0.01
+        NSCursor.closedHand.set()
+        needsDisplay = true
+    }
+
+    private func finishSelectionMove() {
+        if selectionDidMove, let originalState = selectionDragOriginalState {
+            pushUndoState(originalState)
+        }
+        selectionDragStart = nil
+        selectionDragOriginalAnnotation = nil
+        selectionDragOriginalState = nil
+        selectionDidMove = false
+        window?.invalidateCursorRects(for: self)
+        needsDisplay = true
+    }
+
+    private func nudgeSelectedAnnotation(by proposed: NSSize) {
+        guard let selectedAnnotationIndex,
+              annotations.indices.contains(selectedAnnotationIndex)
+        else {
+            return
+        }
+        let original = annotations[selectedAnnotationIndex]
+        let delta = clampedTranslation(for: original, proposed: proposed)
+        guard abs(delta.width) > 0.01 || abs(delta.height) > 0.01 else { return }
+        recordStateForUndo()
+        annotations[selectedAnnotationIndex] = original.translated(by: delta)
+        needsDisplay = true
+    }
+
+    private func clampedTranslation(for annotation: Annotation, proposed: NSSize) -> NSSize {
+        let bounds = annotation.bounds
+        return NSSize(
+            width: MarkupGeometry.clampedTranslationDelta(
+                minimum: bounds.minX,
+                maximum: bounds.maxX,
+                limit: image.size.width,
+                proposed: proposed.width
+            ),
+            height: MarkupGeometry.clampedTranslationDelta(
+                minimum: bounds.minY,
+                maximum: bounds.maxY,
+                limit: image.size.height,
+                proposed: proposed.height
+            )
+        )
+    }
+
+    private func setSelectedAnnotation(_ index: Int?) {
+        guard selectedAnnotationIndex != index else { return }
+        selectedAnnotationIndex = index
+        onSelectionChanged?(index != nil)
+        needsDisplay = true
+    }
+
+    private func recordStateForUndo() {
+        pushUndoState(annotations)
+    }
+
+    private func pushUndoState(_ state: [Annotation]) {
+        undoStack.append(state)
+        if undoStack.count > 100 {
+            undoStack.removeFirst(undoStack.count - 100)
+        }
         redoStack.removeAll()
+        notifyHistoryChanged()
+    }
+
+    private func notifyHistoryChanged() {
+        onHistoryChanged?(!undoStack.isEmpty, !redoStack.isEmpty)
+    }
+
+    private func cancelInProgressAnnotation() {
+        currentStrokePoints.removeAll()
+        currentShapeStart = nil
+        currentShapeEnd = nil
         needsDisplay = true
     }
 
@@ -1413,6 +2131,13 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
         window?.makeFirstResponder(field)
     }
 
+    private func cancelActiveText() {
+        activeTextField?.removeFromSuperview()
+        activeTextField = nil
+        activeTextOrigin = nil
+        window?.makeFirstResponder(self)
+    }
+
     @objc private func commitActiveText() {
         guard let field = activeTextField,
               let origin = activeTextOrigin
@@ -1424,6 +2149,7 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
         field.removeFromSuperview()
         activeTextField = nil
         activeTextOrigin = nil
+        window?.makeFirstResponder(self)
 
         guard !text.isEmpty else { return }
         append(.text(text, origin: origin, color: currentColor, fontSize: currentFontSize, background: true))
@@ -1452,6 +2178,30 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
         case .marker:
             break
         }
+    }
+
+    private func drawSelectionOverlay(transform: (NSPoint) -> NSPoint) {
+        guard let selectedAnnotationIndex,
+              annotations.indices.contains(selectedAnnotationIndex)
+        else {
+            return
+        }
+
+        let annotationBounds = annotations[selectedAnnotationIndex].bounds
+        let rect = normalizedRect(
+            from: transform(NSPoint(x: annotationBounds.minX, y: annotationBounds.minY)),
+            to: transform(NSPoint(x: annotationBounds.maxX, y: annotationBounds.maxY))
+        ).insetBy(dx: -6, dy: -6)
+
+        let outline = NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5)
+        outline.lineWidth = 3
+        NSColor.white.withAlphaComponent(0.92).setStroke()
+        outline.stroke()
+
+        outline.lineWidth = 1.5
+        outline.setLineDash([5, 4], count: 2, phase: 0)
+        NSColor.controlAccentColor.setStroke()
+        outline.stroke()
     }
 
     private func drawCurrentShape(_ kind: ShapeKind, transform: (NSPoint) -> NSPoint) {
@@ -1532,7 +2282,12 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
         return rect.width / max(image.size.width, 1)
     }
 
-    private func drawMosaic(sourceRect: NSRect, destinationRect: NSRect, strength: CGFloat) {
+    private func drawMosaic(
+        sourceRect: NSRect,
+        destinationRect: NSRect,
+        strength: CGFloat,
+        showsBorder: Bool = true
+    ) {
         guard sourceRect.width >= 2,
               sourceRect.height >= 2,
               destinationRect.width >= 2,
@@ -1546,16 +2301,35 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
             width: max(2, destinationRect.width / blockSize),
             height: max(2, destinationRect.height / blockSize)
         )
-        let pixelated = NSImage(size: pixelatedSize)
-        pixelated.lockFocusFlipped(true)
-        NSGraphicsContext.current?.imageInterpolation = .low
-        image.draw(
-            in: NSRect(origin: .zero, size: pixelatedSize),
-            from: imageSourceRect(from: sourceRect),
-            operation: .copy,
-            fraction: 1
+        let cacheKey = MosaicCacheKey(
+            sourceX: Int((sourceRect.minX * 10).rounded()),
+            sourceY: Int((sourceRect.minY * 10).rounded()),
+            sourceWidth: Int((sourceRect.width * 10).rounded()),
+            sourceHeight: Int((sourceRect.height * 10).rounded()),
+            pixelWidth: Int(pixelatedSize.width.rounded()),
+            pixelHeight: Int(pixelatedSize.height.rounded()),
+            strength: Int((strength * 10).rounded())
         )
-        pixelated.unlockFocus()
+        let pixelated: NSImage
+        if let cached = mosaicCache[cacheKey] {
+            pixelated = cached
+        } else {
+            let generated = NSImage(size: pixelatedSize)
+            generated.lockFocusFlipped(true)
+            NSGraphicsContext.current?.imageInterpolation = .low
+            image.draw(
+                in: NSRect(origin: .zero, size: pixelatedSize),
+                from: imageSourceRect(from: sourceRect),
+                operation: .copy,
+                fraction: 1
+            )
+            generated.unlockFocus()
+            if mosaicCache.count >= 32 {
+                mosaicCache.removeAll(keepingCapacity: true)
+            }
+            mosaicCache[cacheKey] = generated
+            pixelated = generated
+        }
 
         NSGraphicsContext.saveGraphicsState()
         NSBezierPath(roundedRect: destinationRect, xRadius: 4, yRadius: 4).addClip()
@@ -1563,10 +2337,12 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
         pixelated.draw(in: destinationRect, from: NSRect(origin: .zero, size: pixelatedSize), operation: .copy, fraction: 1)
         NSColor.black.withAlphaComponent(0.12).setFill()
         destinationRect.fill()
-        NSColor.white.withAlphaComponent(0.30).setStroke()
-        let border = NSBezierPath(roundedRect: destinationRect, xRadius: 4, yRadius: 4)
-        border.lineWidth = max(1, displayScale)
-        border.stroke()
+        if showsBorder {
+            NSColor.white.withAlphaComponent(0.30).setStroke()
+            let border = NSBezierPath(roundedRect: destinationRect, xRadius: 4, yRadius: 4)
+            border.lineWidth = max(1, displayScale)
+            border.stroke()
+        }
         NSGraphicsContext.restoreGraphicsState()
     }
 
@@ -1630,26 +2406,11 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
         check.stroke()
     }
 
-    private func renderedImage() -> NSImage? {
-        let size = image.size
-        let output = NSImage(size: size)
-        output.lockFocusFlipped(true)
-        image.draw(in: NSRect(origin: .zero, size: size))
-        let transform: (NSPoint) -> NSPoint = { $0 }
-        for annotation in annotations {
-            drawForExport(annotation, transform: transform)
-        }
-        output.unlockFocus()
-        return output
-    }
-
     private func displayScale(for imageSize: NSSize, in containerSize: NSSize) -> CGFloat {
         calculatePreviewScale(for: imageSize, viewportSize: containerSize)
     }
 
     private func drawForExport(_ annotation: Annotation, transform: (NSPoint) -> NSPoint) {
-        let previousRect = imageRect
-        _ = previousRect
         switch annotation {
         case let .stroke(points, color, width, alpha):
             guard points.count > 1 else { return }
@@ -1680,7 +2441,7 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
             }
         case let .mosaic(start, end, strength):
             let rect = normalizedRect(from: start, to: end)
-            drawMosaic(sourceRect: rect, destinationRect: rect, strength: strength)
+            drawMosaic(sourceRect: rect, destinationRect: rect, strength: strength, showsBorder: false)
         case let .marker(number, center, color):
             drawMarker(number: number, center: center, radius: 14, color: color)
         case let .checkmark(center, color):
@@ -1703,24 +2464,7 @@ private final class MarkupCanvasView: NSView, NSTextFieldDelegate {
 }
 
 private func calculatePreviewScale(for imageSize: NSSize, viewportSize: NSSize) -> CGFloat {
-    let fitScale = min(
-        (viewportSize.width - 120) / max(imageSize.width, 1),
-        (viewportSize.height - 140) / max(imageSize.height, 1)
-    )
-    let minUsefulScale = max(
-        1,
-        min(4, min(560 / max(imageSize.width, 1), 420 / max(imageSize.height, 1)))
-    )
-
-    if fitScale >= minUsefulScale {
-        return minUsefulScale
-    }
-
-    if fitScale >= 1 {
-        return fitScale
-    }
-
-    return max(0.25, fitScale)
+    MarkupGeometry.previewScale(for: imageSize, viewportSize: viewportSize)
 }
 
 private func drawArrow(from start: NSPoint, to end: NSPoint, color: NSColor, width: CGFloat) {
@@ -1755,12 +2499,7 @@ private func drawArrow(from start: NSPoint, to end: NSPoint, color: NSColor, wid
 }
 
 private func normalizedRect(from start: NSPoint, to end: NSPoint) -> NSRect {
-    NSRect(
-        x: min(start.x, end.x),
-        y: min(start.y, end.y),
-        width: abs(end.x - start.x),
-        height: abs(end.y - start.y)
-    )
+    MarkupGeometry.normalizedRect(from: start, to: end)
 }
 
 private func log(_ message: String) {

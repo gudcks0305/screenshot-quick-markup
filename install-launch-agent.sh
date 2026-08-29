@@ -9,6 +9,7 @@ APP="$PWD/dist/Screenshot Quick Markup.app"
 CONTENTS="$APP/Contents"
 MACOS="$CONTENTS/MacOS"
 BIN="$MACOS/screenshot-quick-markup"
+SIGNING_IDENTITY="${SCREENSHOT_QUICK_MARKUP_SIGNING_IDENTITY:--}"
 
 rm -rf "$APP"
 mkdir -p "$MACOS"
@@ -32,16 +33,20 @@ cat > "$CONTENTS/Info.plist" <<EOF
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.0</string>
+  <string>0.2.0</string>
   <key>CFBundleVersion</key>
-  <string>1</string>
+  <string>2</string>
   <key>NSHighResolutionCapable</key>
   <true/>
 </dict>
 </plist>
 EOF
 
-codesign --force --deep --sign - "$APP" >/dev/null
+codesign --force --deep --sign "$SIGNING_IDENTITY" "$APP" >/dev/null
+if [ "$SIGNING_IDENTITY" = "-" ]; then
+  echo "Note: ad-hoc signing may require Screen Recording permission again after rebuilds."
+  echo "Set SCREENSHOT_QUICK_MARKUP_SIGNING_IDENTITY to a stable code-signing identity to preserve TCC access."
+fi
 
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -57,7 +62,10 @@ cat > "$PLIST" <<EOF
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
   <key>StandardOutPath</key>
   <string>/tmp/screenshot-quick-markup.out.log</string>
   <key>StandardErrorPath</key>

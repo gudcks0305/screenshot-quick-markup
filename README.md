@@ -5,9 +5,12 @@ Fast macOS screenshot markup tool for `Option+Shift+S`.
 Workflow:
 
 1. Press `Option+Shift+S`
-2. Drag an area, or press `Return` for the full main display
+2. Drag an area, or press `Return` for the full display under the pointer
 3. Mark up the image
-4. Close the editor window to copy the edited PNG to the clipboard
+4. Click `Copy & Close`, or use `Cmd+C` to copy without closing
+
+You can also choose `Mark Up Clipboard Image` from the menu bar item to edit an
+image that is already on the clipboard.
 
 ## Build
 
@@ -24,21 +27,39 @@ swift build -c release
 
 ## Editor Controls
 
-- Tools: select, pen, highlighter, arrow, rectangle, ellipse, blur/mosaic, numbered marker, text
+- Tools: select, pen, highlighter, arrow, rectangle, ellipse, blur/mosaic, numbered marker, check, text
+- Select supports click-to-select, drag-to-move, arrow-key nudging, and `Delete`
 - Color swatches and custom color picker are available in the toolbar
 - Double-click the image to add text quickly
+- Tool shortcuts: `V` select, `P` pen, `H` highlighter, `A` arrow, `R` rectangle, `O` ellipse, `B` blur, `N` marker, `K` check, `T` text
 - `Cmd+Z`: undo
 - `Cmd+Shift+Z`: redo
 - `Cmd+C`: copy edited image to clipboard
 - `Cmd+S`: save edited PNG
-- Toolbar `Copy`, `Save`, and `Done` buttons are available
-- Close window: copy edited image to clipboard
+- `Cmd+W`: close the current capture tab/window without changing the clipboard
+- Toolbar `Undo`, `Redo`, `Delete`, `Copy`, `Save`, and `Copy & Close` buttons are available
+- Closing the window normally discards the editor session without replacing the clipboard
+- PNG export preserves the captured image's native pixel dimensions
+
+## Test
+
+```sh
+swift test
+```
 
 ## Install As Login Agent
 
 ```sh
 cd /Users/yuhyeongchan/project/apps/screenshot-quick-markup
 ./install-launch-agent.sh
+```
+
+By default the bundle is ad-hoc signed, so macOS can ask for Screen Recording
+permission again after the executable changes. If you have a stable local code
+signing identity, preserve permission across rebuilds with:
+
+```sh
+SCREENSHOT_QUICK_MARKUP_SIGNING_IDENTITY="Apple Development: Your Name" ./install-launch-agent.sh
 ```
 
 Logs:

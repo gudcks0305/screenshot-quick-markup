@@ -14,9 +14,17 @@ let package = Package(
         )
     ],
     targets: [
+        .target(
+            name: "ScreenshotQuickMarkupCore"
+        ),
         .executableTarget(
             name: "ScreenshotQuickMarkup",
+            dependencies: ["ScreenshotQuickMarkupCore"],
             path: "Sources/ScreenshotQuickMarkup"
+        ),
+        .testTarget(
+            name: "ScreenshotQuickMarkupCoreTests",
+            dependencies: ["ScreenshotQuickMarkupCore"]
         )
     ]
 )
