@@ -97,7 +97,7 @@ Logs:
 The installer builds a stable app bundle at:
 
 ```text
-/Users/yuhyeongchan/project/apps/screenshot-quick-markup/dist/Screenshot Quick Markup.app
+/Applications/Screenshot Quick Markup.app
 ```
 
 Grant Screen Recording permission to `Screenshot Quick Markup.app`, not the raw

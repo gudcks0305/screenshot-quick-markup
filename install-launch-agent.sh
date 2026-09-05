@@ -11,11 +11,19 @@ if [ ! -x "$MARKUP_SOURCE_BIN" ]; then
 fi
 
 PLIST="$HOME/Library/LaunchAgents/com.local.screenshot-quick-markup.plist"
-APP="$PWD/dist/Screenshot Quick Markup.app"
+APP="/Applications/Screenshot Quick Markup.app"
 CONTENTS="$APP/Contents"
 MACOS="$CONTENTS/MacOS"
 BIN="$MACOS/screenshot-quick-markup"
 SIGNING_IDENTITY="${SCREENSHOT_QUICK_MARKUP_SIGNING_IDENTITY:--}"
+
+if [ -e "$APP" ]; then
+  MARKUP_INSTALLED_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist" 2>/dev/null || true)"
+  if [ "$MARKUP_INSTALLED_ID" != "com.local.screenshot-quick-markup" ]; then
+    echo "Refusing to replace a different application at $APP" >&2
+    exit 1
+  fi
+fi
 
 rm -rf "$APP"
 mkdir -p "$MACOS"
