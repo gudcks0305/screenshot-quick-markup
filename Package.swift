@@ -25,6 +25,10 @@ let package = Package(
         .testTarget(
             name: "ScreenshotQuickMarkupCoreTests",
             dependencies: ["ScreenshotQuickMarkupCore"]
+        ),
+        .testTarget(
+            name: "ScreenshotQuickMarkupTests",
+            dependencies: ["ScreenshotQuickMarkup"]
         )
     ]
 )

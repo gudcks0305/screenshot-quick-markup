@@ -3,6 +3,12 @@ set -eu
 
 cd "$(dirname "$0")"
 swift build -c release
+MARKUP_BUILD_DIR="$(swift build -c release --show-bin-path)"
+MARKUP_SOURCE_BIN="$MARKUP_BUILD_DIR/screenshot-quick-markup"
+if [ ! -x "$MARKUP_SOURCE_BIN" ]; then
+  echo "Built executable not found: $MARKUP_SOURCE_BIN" >&2
+  exit 1
+fi
 
 PLIST="$HOME/Library/LaunchAgents/com.local.screenshot-quick-markup.plist"
 APP="$PWD/dist/Screenshot Quick Markup.app"
@@ -13,7 +19,7 @@ SIGNING_IDENTITY="${SCREENSHOT_QUICK_MARKUP_SIGNING_IDENTITY:--}"
 
 rm -rf "$APP"
 mkdir -p "$MACOS"
-cp "$PWD/.build/release/screenshot-quick-markup" "$BIN"
+cp "$MARKUP_SOURCE_BIN" "$BIN"
 
 cat > "$CONTENTS/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -33,9 +39,9 @@ cat > "$CONTENTS/Info.plist" <<EOF
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.2.0</string>
+  <string>0.3.0</string>
   <key>CFBundleVersion</key>
-  <string>2</string>
+  <string>3</string>
   <key>NSHighResolutionCapable</key>
   <true/>
 </dict>

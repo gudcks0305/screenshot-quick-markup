@@ -12,6 +12,10 @@ Workflow:
 You can also choose `Mark Up Clipboard Image` from the menu bar item to edit an
 image that is already on the clipboard.
 
+Choose `Open Image…` (`Cmd+O`) or drop a local image onto the canvas to open it
+in a new editor. The editor has a tool rail, a contextual inspector, and a
+zoom/status bar, with native light and dark appearances.
+
 ## Build
 
 ```sh
@@ -22,16 +26,21 @@ swift build -c release
 ## Run
 
 ```sh
-.build/release/screenshot-quick-markup
+MARKUP_BUILD_DIR="$(swift build -c release --show-bin-path)"
+"$MARKUP_BUILD_DIR/screenshot-quick-markup"
 ```
 
 ## Editor Controls
 
-- Tools: select, pen, highlighter, arrow, rectangle, ellipse, blur/mosaic, numbered marker, check, text
+- Tools: select, pen, highlighter, arrow, rectangle, ellipse, blur/mosaic, opaque redaction, numbered marker, check, text
 - Select supports click-to-select, drag-to-move, arrow-key nudging, and `Delete`
+- Change a selected annotation's color, stroke width, or text size in the inspector
+- Drag selection handles to resize shapes, blur areas, and redactions
+- Double-click existing text, or choose `Edit Text`, to edit it; `Escape` cancels
+- Editing, resizing, and text changes support undo/redo
 - Color swatches and custom color picker are available in the toolbar
 - Double-click the image to add text quickly
-- Tool shortcuts: `V` select, `P` pen, `H` highlighter, `A` arrow, `R` rectangle, `O` ellipse, `B` blur, `N` marker, `K` check, `T` text
+- Tool shortcuts: `V` select, `P` pen, `H` highlighter, `A` arrow, `R` rectangle, `O` ellipse, `B` blur, `X` redact, `N` marker, `K` check, `T` text
 - `Cmd+Z`: undo
 - `Cmd+Shift+Z`: redo
 - `Cmd+C`: copy edited image to clipboard
@@ -40,12 +49,28 @@ swift build -c release
 - Toolbar `Undo`, `Redo`, `Delete`, `Copy`, `Save`, and `Copy & Close` buttons are available
 - Closing the window normally discards the editor session without replacing the clipboard
 - PNG export preserves the captured image's native pixel dimensions
+- PNG encoding runs off the main thread. Editing pauses during export; unchanged exports are reused
+- Redact paints opaque black over the final image, above other annotations; use it instead of blur for complete coverage
 
 ## Test
 
 ```sh
 swift test
 ```
+
+Tests cover core geometry, rendering, editing/undo, native text commands,
+image import, redaction, and cache limits. See [PERFORMANCE.md](PERFORMANCE.md)
+for scoped measurements and [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md) for the
+delivery scope and follow-up work.
+
+## Source Layout
+
+- `main.swift` handles process startup; `ScreenshotQuickMarkupApp` owns the app lifecycle.
+- `ScreenCapture` and `CaptureOverlay` handle capture and area selection.
+- Editor window/view controllers manage window actions and toolbar controls.
+- `MarkupCanvasView` owns editing interactions and history; `AnnotationRenderer` owns drawing, PNG export, and the mosaic cache.
+- `Annotation`, `MarkupTool`, and `EditorPreferences` hold annotation data, tool metadata, and persisted settings.
+- `ScreenshotQuickMarkupCore` contains UI-independent geometry.
 
 ## Install As Login Agent
 
